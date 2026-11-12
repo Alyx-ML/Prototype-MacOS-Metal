@@ -1,0 +1,2 @@
+;; Game-specific llasm macros for the Prototype engine.
+;; SRW Windows output uses only the macros in SR/llasm-support.

@@ -1,0 +1,2 @@
+loc_4025B7,launcher_entry
+loc_400000,launcher_image

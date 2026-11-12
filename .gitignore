@@ -1,0 +1,36 @@
+# This repository holds no game files and no game code.
+# The translated game code is the game's code: never commit it.
+
+# Build output: the app links the translated game code.
+/build/
+
+# Translation work files. Only the hand-written and generated analysis
+# files (addresses and flags, no code bytes) are part of the repository.
+/work/**
+!/work/*/
+!/work/*/*.sci
+!/work/*/SR.cfg
+!/work/launcher/relocations.csv
+
+# Game files and translated output, wherever they are.
+*.exe
+*.dll
+*.asi
+*.rcf
+*.bik
+*.o
+*.a
+*.bc
+*.ll
+*.resdump
+disasm.cache
+*.log
+*.err
+*.out
+# Translated modules (runtime/llasm holds runtime source, not game code).
+/work/**/*.llasm
+/work/**/*.llinc
+
+# Local tool state.
+.claude/
+.DS_Store

@@ -1,0 +1,43 @@
+;; Calls from the runtime (C) into guest code.
+;;
+;; llasm makes a C function c_rt_call_c2asm(_cpu *cpu) for this procedure.
+;; That function pushes a return address and calls the procedure. The guest
+;; function returns to that address, and then c_rt_call_c2asm returns to C.
+;;
+;; Stack on entry:
+;;   [esp]      return address (pushed by c_rt_call_c2asm)
+;;   [esp + 4]  guest address of the function to call (pushed by rt_call)
+;;   [esp + 8]  first argument of the function
+;;
+;; The procedure removes the function address, so the function sees the
+;; return address followed by its arguments.
+
+include llasm.llinc
+
+proc rt_call_c2asm global c_rt_call_c2asm
+        load tmp1, esp, 4
+        add tmp2, esp, 4
+        load tmp0, tmp2, 4
+        store tmp1, tmp2, 4
+        add esp, esp, 4
+        tcall tmp0
+endp
+
+;; Return target for a fiber start procedure. A fiber procedure that returns
+;; ends the thread (Windows behavior). rt_fiber_returned does not return.
+funcv rt_fiber_returned $
+proc rt_fiber_exit_asm2c public
+        call rt_fiber_returned $
+        tcall eax
+endp
+
+;; Exception handler of the frame that the runtime registers around each
+;; call of an exception handler (rt_seh.c). It is a __cdecl function with
+;; four arguments: the caller removes them.
+funcv rt_seh_nested_handler $
+proc rt_seh_nested_asm2c public
+        call rt_seh_nested_handler $
+        load tmp0, esp, 4
+        add esp, esp, 4
+        tcall tmp0
+endp
