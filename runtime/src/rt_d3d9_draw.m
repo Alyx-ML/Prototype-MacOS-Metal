@@ -24,6 +24,7 @@
  *     vertices (both map NDC +y to the top of the target).
  */
 #import "rt_d3d9_int.h"
+#include "rt_enh.h"
 #include "rt_window.h"
 
 #include <math.h>
@@ -65,16 +66,31 @@ static const char builtin_src[] =
     "    o.uv = float2(q.x, 1.0 - q.y);\n"
     "    return o;\n"
     "}\n"
+    /* use_lut: apply the gamma ramp of SetGammaRamp. hdr: the drawable is
+       extended linear sRGB (Mac enhancement HDR); the highlights are expanded
+       up to the EDR headroom of the display, and SDR white stays at 1.
+       src_linear: the source texture is an sRGB format (samples are linear). */
+    "struct PresentParams { uint use_lut; uint hdr; float headroom; uint src_linear; };\n"
+    "static float3 to_linear(float3 c) { return select(pow((c + 0.055) / 1.055, 2.4), c / 12.92, c <= 0.04045); }\n"
+    "static float3 to_srgb(float3 c) { return select(1.055 * pow(c, 1.0 / 2.4) - 0.055, c * 12.92, c <= 0.0031308); }\n"
     "fragment float4 present_fs(QV in [[stage_in]], texture2d<float> src [[texture(0)]],\n"
-    "    texture2d<float> lut [[texture(1)]], sampler s [[sampler(0)]], constant uint &use_lut [[buffer(0)]])\n"
+    "    texture2d<float> lut [[texture(1)]], sampler s [[sampler(0)]], constant PresentParams &pp [[buffer(0)]])\n"
     "{\n"
     "    float4 c = src.sample(s, in.uv);\n"
-    "    if (use_lut != 0u) {\n"
+    "    if (pp.src_linear != 0u) c.rgb = to_srgb(saturate(c.rgb));\n"
+    "    if (pp.use_lut != 0u) {\n"
     "        constexpr sampler ls(filter::linear, address::clamp_to_edge);\n"
     "        float3 t = saturate(c.rgb) * (255.0 / 256.0) + (0.5 / 256.0);\n"
     "        c.r = lut.sample(ls, float2(t.r, 0.5)).r;\n"
     "        c.g = lut.sample(ls, float2(t.g, 0.5)).g;\n"
     "        c.b = lut.sample(ls, float2(t.b, 0.5)).b;\n"
+    "    }\n"
+    "    if (pp.hdr != 0u) {\n"
+    "        float3 l = to_linear(saturate(c.rgb));\n"
+    "        float y = dot(l, float3(0.2126, 0.7152, 0.0722));\n"
+    "        float y2 = y * y;\n"
+    "        l *= 1.0 + (max(pp.headroom, 1.0) - 1.0) * y2 * y2;\n"
+    "        return float4(l, 1.0);\n"
     "    }\n"
     "    return float4(c.rgb, 1.0);\n"
     "}\n"
@@ -151,6 +167,10 @@ void d3d_draw_init(D3DDevice *d)
         d->present_pso = [d->mtl newRenderPipelineStateWithDescriptor:pd error:&err];
         if (d->present_pso == nil)
             rt_fatal("D3D9: present pipeline creation failed: %s", err.localizedDescription.UTF8String);
+        pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+        d->present_pso_hdr = [d->mtl newRenderPipelineStateWithDescriptor:pd error:&err];
+        if (d->present_pso_hdr == nil)
+            rt_fatal("D3D9: HDR present pipeline creation failed: %s", err.localizedDescription.UTF8String);
 
         MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
         sd.minFilter = MTLSamplerMinMagFilterLinear;
@@ -263,9 +283,10 @@ static void begin_pass(D3DDevice *d)
 {
     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
     bool srgb = d->rs[RS_SRGBWRITEENABLE] != 0;
-    uint32_t i, w = UINT32_MAX, h = UINT32_MAX, samples = 0;
+    uint32_t i, w = UINT32_MAX, h = UINT32_MAX, samples = 0, scale;
     NSUInteger slice, level;
     if (d->rt[0] == NULL) rt_fatal("D3D9: render pass without render target 0");
+    scale = d3d_surf(d->rt[0])->scale;
     for (i = 0; i < D3D_MAX_RT; i++)
     {
         D3DSurface *s;
@@ -290,8 +311,12 @@ static void begin_pass(D3DDevice *d)
         else
             ca.loadAction = MTLLoadActionLoad;
         ca.storeAction = MTLStoreActionStore;
-        if (s->width < w) w = s->width;
-        if (s->height < h) h = s->height;
+        if (s->scale != scale)
+            rt_fatal("D3D9: render targets of %ux%u (%ux shadow resolution) and %ux%u (%ux) in one pass; set \"Shadow "
+                     "Resolution\" to \"Game\" in the Video options",
+                     d3d_surf(d->rt[0])->width, d3d_surf(d->rt[0])->height, scale, s->width, s->height, s->scale);
+        if (s->width * s->scale < w) w = s->width * s->scale;
+        if (s->height * s->scale < h) h = s->height * s->scale;
         if (samples == 0)
             samples = (uint32_t)t.sampleCount;
         else if (samples != t.sampleCount)
@@ -305,6 +330,10 @@ static void begin_pass(D3DDevice *d)
     {
         D3DSurface *s = d3d_surf(d->ds);
         id<MTLTexture> t = attach_texture(s, false, &slice, &level);
+        if (s->scale != scale)
+            rt_fatal("D3D9: a %ux%u render target (%ux shadow resolution) with a %ux%u depth-stencil surface (%ux); set "
+                     "\"Shadow Resolution\" to \"Game\" in the Video options",
+                     d3d_surf(d->rt[0])->width, d3d_surf(d->rt[0])->height, scale, s->width, s->height, s->scale);
         if (t.sampleCount != samples)
         {
             /* Direct3D 9 draws with a depth-stencil surface whose sample
@@ -361,6 +390,7 @@ no_ds:
     d->pass_samples = samples;
     d->pass_w = w;
     d->pass_h = h;
+    d->pass_scale = scale;
     d->pass_srgb = srgb;
     enc_state_reset(d);
 }
@@ -943,9 +973,12 @@ void rt_com_D3DDevice9_Clear(_cpu *cpu)
             }
         {
             int32_t pass_area[4] = { 0, 0, (int32_t)d->pass_w, (int32_t)d->pass_h };
-            uint32_t m = 0;
+            uint32_t m = 0, k;
             for (i = 0; i < n; i++)
+            {
+                for (k = 0; k < 4; k++) list[i][k] *= (int32_t)d->pass_scale;
                 if (clip_rect(list[i], pass_area)) memcpy(list[m++], list[i], sizeof list[i]);
+            }
             n = m;
         }
         if (n > 0) clear_quads(d, flags, (const int32_t(*)[4])list, n, rgba, z, stencil);
@@ -1007,6 +1040,10 @@ static id<MTLSamplerState> sampler_for(D3DDevice *d, const uint32_t *ss, uint32_
     k.w = ss[SS_ADDRESSW];
     k.border = (k.u == 4 || k.v == 4 || k.w == 4) ? ss[SS_BORDERCOLOR] : 0;
     k.aniso = (k.min == 3 || k.mag == 3) ? ss[SS_MAXANISOTROPY] : 1;
+    /* Mac enhancement: 16x anisotropic filtering for the mipmapped textures
+       with linear filtering. Point-filtered textures (text, interface) and
+       depth comparison samplers (shadows) keep the game setting. */
+    if (rt_enh_get(RT_ENH_ANISOTROPY) != 0 && !compare && k.mip != 0 && k.min >= 2 && k.mag >= 2) k.aniso = 16;
     lmin = ss[SS_MAXMIPLEVEL] > lod ? ss[SS_MAXMIPLEVEL] : lod;
     k.lodmin = lmin;
     k.compare = compare;
@@ -1451,10 +1488,10 @@ static uint32_t do_draw(D3DDevice *d, draw_info *di)
             d->es_slope = slope;
         }
     }
-    vp.originX = d->viewport[0];
-    vp.originY = d->viewport[1];
-    vp.width = d->viewport[2];
-    vp.height = d->viewport[3];
+    vp.originX = (double)d->viewport[0] * d->pass_scale;
+    vp.originY = (double)d->viewport[1] * d->pass_scale;
+    vp.width = (double)d->viewport[2] * d->pass_scale;
+    vp.height = (double)d->viewport[3] * d->pass_scale;
     vp.znear = d3d_f(d->viewport[4]);
     vp.zfar = d3d_f(d->viewport[5]);
     if (!d->es_valid || memcmp(&d->es_vp, &vp, sizeof vp) != 0)
@@ -1464,8 +1501,10 @@ static uint32_t do_draw(D3DDevice *d, draw_info *di)
     }
     {
         int32_t r[4] = { 0, 0, (int32_t)d->pass_w, (int32_t)d->pass_h };
+        int32_t sc[4], si;
         MTLScissorRect sr;
-        if (d->rs[RS_SCISSORTESTENABLE] && !clip_rect(r, d->scissor)) return D3D_OK; /* nothing is drawn */
+        for (si = 0; si < 4; si++) sc[si] = d->scissor[si] * (int32_t)d->pass_scale;
+        if (d->rs[RS_SCISSORTESTENABLE] && !clip_rect(r, sc)) return D3D_OK; /* nothing is drawn */
         if (!d->rs[RS_SCISSORTESTENABLE])
         {
             int32_t full[4] = { 0, 0, (int32_t)d->pass_w, (int32_t)d->pass_h };
@@ -1804,6 +1843,8 @@ void rt_com_D3DDevice9_StretchRect(_cpu *cpu)
     }
     src = d3d_surf(d3d_surface_from_ptr(ARG(1)));
     dst = d3d_surf(d3d_surface_from_ptr(ARG(3)));
+    d3d_check_unscaled(src, "StretchRect");
+    d3d_check_unscaled(dst, "StretchRect");
     d3d_lock(d);
     @autoreleasepool
     {
@@ -1907,6 +1948,7 @@ void rt_com_D3DDevice9_ColorFill(_cpu *cpu)
         return;
     }
     s = d3d_surf(d3d_surface_from_ptr(ARG(1)));
+    d3d_check_unscaled(s, "ColorFill");
     d3d_lock(d);
     @autoreleasepool
     {
@@ -2022,6 +2064,7 @@ void d3d_present(D3DDevice *d)
         id<MTLTexture> src = bb->tex;
         CGSize bounds, size;
         CGFloat scale;
+        float headroom;
         id<CAMetalDrawable> dr;
         uint32_t slot;
         uint64_t old;
@@ -2047,8 +2090,10 @@ void d3d_present(D3DDevice *d)
         scale = d->layer.contentsScale;
         size = CGSizeMake(floor(bounds.width * scale), floor(bounds.height * scale));
         dr = nil;
+        headroom = 1.0f;
         if (size.width >= 1 && size.height >= 1 && !rt_cocoa_headless())
         {
+            headroom = d3d_post_hdr_begin(d);
             if (!CGSizeEqualToSize(d->layer.drawableSize, size)) d->layer.drawableSize = size;
             dr = [d->layer nextDrawable];
         }
@@ -2057,15 +2102,9 @@ void d3d_present(D3DDevice *d)
             MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
             id<MTLRenderCommandEncoder> e;
             MTLViewport vp;
-            uint32_t use_lut = 0;
+            struct { uint32_t use_lut, hdr; float headroom; uint32_t src_linear; } pp_args = { 0, 0, 1.0f, 0 };
             double dw = size.width, dh = size.height, bw = bb->width, bh = bb->height;
-            rp.colorAttachments[0].texture = dr.texture;
-            rp.colorAttachments[0].loadAction = MTLLoadActionClear;
-            rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
-            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-            e = [d->cb renderCommandEncoderWithDescriptor:rp];
-            if (e == nil) rt_fatal("D3D9: present encoder creation failed");
-            [e setRenderPipelineState:d->present_pso];
+            MTLPixelFormat dfmt = dr.texture.pixelFormat;
             if (d->pp[PP_WINDOWED])
             {
                 /* Windowed: the back buffer fills the client area. */
@@ -2083,15 +2122,29 @@ void d3d_present(D3DDevice *d)
                 vp.height = floor(bh * sc);
                 vp.originX = floor((dw - vp.width) / 2);
                 vp.originY = floor((dh - vp.height) / 2);
-                use_lut = d->gamma_set && d->gamma_tex != nil;
+                pp_args.use_lut = d->gamma_set && d->gamma_tex != nil;
             }
             vp.znear = 0;
             vp.zfar = 1;
+            /* Mac enhancements: SMAA, MetalFX upscaling, sharpening. */
+            src = d3d_post_process(d, src, (uint32_t)vp.width, (uint32_t)vp.height);
+            if (dfmt != MTLPixelFormatBGRA8Unorm && dfmt != MTLPixelFormatRGBA16Float)
+                rt_fatal("D3D9: the drawable has the pixel format %lu (expected BGRA8Unorm or RGBA16Float)", (unsigned long)dfmt);
+            pp_args.hdr = dfmt == MTLPixelFormatRGBA16Float;
+            pp_args.headroom = headroom;
+            pp_args.src_linear = src.pixelFormat == MTLPixelFormatBGRA8Unorm_sRGB || src.pixelFormat == MTLPixelFormatRGBA8Unorm_sRGB;
+            rp.colorAttachments[0].texture = dr.texture;
+            rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+            rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            e = [d->cb renderCommandEncoderWithDescriptor:rp];
+            if (e == nil) rt_fatal("D3D9: present encoder creation failed");
+            [e setRenderPipelineState:pp_args.hdr ? d->present_pso_hdr : d->present_pso];
             [e setViewport:vp];
             [e setFragmentTexture:src atIndex:0];
-            [e setFragmentTexture:use_lut ? d->gamma_tex : d->null_tex2d atIndex:1];
-            [e setFragmentSamplerState:(vp.width == bw && vp.height == bh) ? d->present_point : d->present_linear atIndex:0];
-            [e setFragmentBytes:&use_lut length:sizeof use_lut atIndex:0];
+            [e setFragmentTexture:pp_args.use_lut ? d->gamma_tex : d->null_tex2d atIndex:1];
+            [e setFragmentSamplerState:(vp.width == (double)src.width && vp.height == (double)src.height) ? d->present_point : d->present_linear atIndex:0];
+            [e setFragmentBytes:&pp_args length:sizeof pp_args atIndex:0];
             [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
             [e endEncoding];
             [d->cb presentDrawable:dr];

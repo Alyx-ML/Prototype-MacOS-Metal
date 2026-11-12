@@ -10,13 +10,21 @@
  * Vibration: the left motor (low frequency) is the haptic engine of the
  * left handle, the right motor (high frequency) the right handle. A
  * controller without haptics accepts XInputSetState without vibration, as
- * a Windows controller without motors does.
+ * a Windows controller without motors does. With the Mac setting
+ * "Enhanced Rumble" (rt_enh.h) each motor gets its own haptic sharpness
+ * (a soft left motor and a sharp right motor) and a square-root intensity
+ * curve, so that weak vibration can be felt.
+ *
+ * Adaptive triggers: with the Mac setting "Adaptive Triggers", a DualSense
+ * controller gets light resistance on L2 and R2. While a motor runs, the
+ * trigger on the same side vibrates with the motor intensity.
  */
 #import <CoreHaptics/CoreHaptics.h>
 #import <Foundation/Foundation.h>
 #import <GameController/GameController.h>
 
 #include "rt.h"
+#include "rt_enh.h"
 
 #include <pthread.h>
 
@@ -39,6 +47,13 @@ static GCController *__strong pad_ctl[XUSER_MAX_COUNT];
 static CHHapticEngine *__strong engines[XUSER_MAX_COUNT][2];
 static id<CHHapticAdvancedPatternPlayer> __strong players[XUSER_MAX_COUNT][2];
 static dispatch_queue_t pad_queue;
+/* The rumble mode (RT_ENH_RUMBLE value) that each player was made with. */
+static int player_mode[XUSER_MAX_COUNT][2];
+/* The last motor speeds that the game set. */
+static uint16_t motor_speed[XUSER_MAX_COUNT][2];
+/* Adaptive trigger state that was sent to the controller: -1 not known,
+   0 off, 1 resistance, 2 + n vibration with amplitude level n (1-8). */
+static int trig_state[XUSER_MAX_COUNT][2];
 
 static void plock(void)
 {
@@ -128,6 +143,8 @@ static void attach(GCController *c)
     memset(&pads[slot], 0, sizeof pads[slot]);
     pads[slot].connected = true;
     pads[slot].haptics = c.haptics != nil;
+    motor_speed[slot][0] = motor_speed[slot][1] = 0;
+    trig_state[slot][0] = trig_state[slot][1] = -1;
     punlock();
     c.playerIndex = (GCControllerPlayerIndex)slot;
     c.handlerQueue = pad_queue;
@@ -154,6 +171,8 @@ static void detach(GCController *c)
             [engines[i][k] stopWithCompletionHandler:nil];
             engines[i][k] = nil;
             players[i][k] = nil;
+            motor_speed[i][k] = 0;
+            trig_state[i][k] = -1;
         }
     }
     punlock();
@@ -176,6 +195,56 @@ static void init_pads(void)
     dispatch_once_f(&once, NULL, init_once);
 }
 
+#define TRIG_LEVELS 8
+
+/* Send the adaptive trigger modes of a DualSense controller in slot user
+   when they changed (pad lock held). */
+static void apply_triggers(uint32_t user)
+{
+    GCController *c = pad_ctl[user];
+    GCDualSenseGamepad *ds;
+    bool on = rt_enh_get(RT_ENH_TRIGGERS) != 0;
+    int k;
+    if (c == nil || ![c.extendedGamepad isKindOfClass:GCDualSenseGamepad.class]) return;
+    ds = (GCDualSenseGamepad *)c.extendedGamepad;
+    for (k = 0; k < 2; k++)
+    {
+        GCDualSenseAdaptiveTrigger *t = k == 0 ? ds.leftTrigger : ds.rightTrigger;
+        int want = 0;
+        if (on)
+        {
+            int level = (motor_speed[user][k] * TRIG_LEVELS + 65534) / 65535;
+            want = level == 0 ? 1 : 1 + level;
+        }
+        if (want == trig_state[user][k]) continue;
+        if (want == 0)
+            [t setModeOff];
+        else if (want == 1)
+            [t setModeFeedbackWithStartPosition:0.25f resistiveStrength:0.3f];
+        else
+            [t setModeVibrationWithStartPosition:0.1f
+                                       amplitude:(float)(want - 1) / (float)TRIG_LEVELS
+                                       frequency:k == 0 ? 0.15f : 0.45f];
+        trig_state[user][k] = want;
+    }
+}
+
+int rt_xinput_pad_kind(void)
+{
+    int kind = RT_PAD_NONE;
+    init_pads();
+    plock();
+    if (pads[0].connected && pad_ctl[0] != nil)
+    {
+        GCExtendedGamepad *g = pad_ctl[0].extendedGamepad;
+        kind = [g isKindOfClass:GCDualSenseGamepad.class] || [g isKindOfClass:GCDualShockGamepad.class]
+                   ? RT_PAD_PLAYSTATION
+                   : RT_PAD_OTHER;
+    }
+    punlock();
+    return kind;
+}
+
 /* DWORD XInputGetState(DWORD user, XINPUT_STATE *)
    XINPUT_STATE (16 bytes): dwPacketNumber, wButtons, bLeftTrigger,
    bRightTrigger, sThumbLX, sThumbLY, sThumbRX, sThumbRY. */
@@ -191,6 +260,13 @@ void rt_XInputGetState(_cpu *cpu)
     }
     plock();
     s = pads[user];
+    if (s.connected)
+    {
+        @autoreleasepool
+        {
+            apply_triggers(user);
+        }
+    }
     punlock();
     if (!s.connected)
     {
@@ -213,8 +289,16 @@ static void motor(int user, int k, uint16_t speed)
 {
     NSError *err = nil;
     GCController *c = pad_ctl[user];
+    int mode = rt_enh_get(RT_ENH_RUMBLE);
     float v = (float)speed / 65535.0f;
     if (c.haptics == nil) return;
+    if (mode != 0) v = sqrtf(v);
+    if (players[user][k] != nil && player_mode[user][k] != mode)
+    {
+        if (![players[user][k] stopAtTime:CHHapticTimeImmediate error:&err])
+            rt_log("XInput: vibration stop failed: %s", err.localizedDescription.UTF8String ?: "");
+        players[user][k] = nil;
+    }
     if (speed == 0)
     {
         if (players[user][k] != nil && ![players[user][k] stopAtTime:CHHapticTimeImmediate error:&err])
@@ -240,10 +324,16 @@ static void motor(int user, int k, uint16_t speed)
     }
     if (players[user][k] == nil)
     {
-        CHHapticEvent *e = [[CHHapticEvent alloc] initWithEventType:CHHapticEventTypeHapticContinuous
-                                                         parameters:@[ [[CHHapticEventParameter alloc] initWithParameterID:CHHapticEventParameterIDHapticIntensity value:1.0f] ]
-                                                       relativeTime:0
-                                                           duration:30.0];
+        NSMutableArray<CHHapticEventParameter *> *ep = [NSMutableArray arrayWithObject:
+            [[CHHapticEventParameter alloc] initWithParameterID:CHHapticEventParameterIDHapticIntensity value:1.0f]];
+        CHHapticEvent *e;
+        if (mode != 0)
+            [ep addObject:[[CHHapticEventParameter alloc] initWithParameterID:CHHapticEventParameterIDHapticSharpness
+                                                                        value:k == 0 ? 0.1f : 0.7f]];
+        e = [[CHHapticEvent alloc] initWithEventType:CHHapticEventTypeHapticContinuous
+                                          parameters:ep
+                                        relativeTime:0
+                                            duration:30.0];
         CHHapticPattern *pat = [[CHHapticPattern alloc] initWithEvents:@[ e ] parameters:@[] error:&err];
         id<CHHapticAdvancedPatternPlayer> pl = pat != nil ? [engines[user][k] createAdvancedPlayerWithPattern:pat error:&err] : nil;
         if (pl == nil)
@@ -258,6 +348,7 @@ static void motor(int user, int k, uint16_t speed)
             return;
         }
         players[user][k] = pl;
+        player_mode[user][k] = mode;
     }
     if (![players[user][k] sendParameters:@[ [[CHHapticDynamicParameter alloc] initWithParameterID:CHHapticDynamicParameterIDHapticIntensityControl value:v relativeTime:0] ]
                                    atTime:CHHapticTimeImmediate
@@ -285,8 +376,11 @@ void rt_XInputSetState(_cpu *cpu)
     }
     @autoreleasepool
     {
-        motor((int)user, 0, rd16(p));
-        motor((int)user, 1, rd16(p + 2));
+        motor_speed[user][0] = rd16(p);
+        motor_speed[user][1] = rd16(p + 2);
+        motor((int)user, 0, motor_speed[user][0]);
+        motor((int)user, 1, motor_speed[user][1]);
+        apply_triggers(user);
     }
     punlock();
     RET(0);

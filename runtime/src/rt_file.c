@@ -1,6 +1,7 @@
 /* The emulated file system and the KERNEL32, SHELL32 and SHLWAPI file
    functions. See rt_file.h for the guest directory layout. */
 #include "rt_file.h"
+#include "rt_menu.h"
 #include "rt_module.h"
 #include "rt_object.h"
 #include "rt_thread.h"
@@ -450,6 +451,9 @@ typedef struct file_data {
     int fd;
     bool is_dir;
     bool delete_on_close;
+    /* The virtual file of art.rcf with the patched options menus
+       (rt_menu.h), or NULL. */
+    const rt_file_overlay *ov;
     char host[RT_HOST_PATH];
 } file_data;
 
@@ -566,6 +570,7 @@ void rt_CreateFileA(_cpu *cpu)
     f->is_dir = (oflags & O_DIRECTORY) != 0;
     f->delete_on_close = (flags & FILE_FLAG_DELETE_ON_CLOSE) != 0;
     snprintf(f->host, sizeof(f->host), "%s", host);
+    if (!f->is_dir && (oflags & O_ACCMODE) == O_RDONLY) f->ov = rt_menu_overlay(host, fd);
     if ((flags & 0x1u) && (oflags & O_CREAT) && !exists)
     {
         /* FILE_ATTRIBUTE_READONLY on a new file. */
@@ -647,12 +652,26 @@ void rt_ReadFile(_cpu *cpu)
         RET(0);
         return;
     }
-    if (!seek_overlapped(f->fd, ov))
+    if (f->ov != NULL)
+    {
+        /* The virtual file: read at the file position (or the OVERLAPPED
+           offset), then set the file position after the data. */
+        off_t pos = ov != 0 ? (off_t)(((uint64_t)rd32(ov + 12) << 32) | rd32(ov + 8)) : lseek(f->fd, 0, SEEK_CUR);
+        ssize_t r = pos < 0 ? -1 : rt_overlay_pread(f->ov, f->fd, G2H(buf), n, (uint64_t)pos);
+        if (r < 0 || lseek(f->fd, pos + (off_t)(r < 0 ? 0 : r), SEEK_SET) < 0)
+        {
+            rt_set_last_error(rt_errno_to_win32(errno, ERROR_INVALID_HANDLE));
+            ok = false;
+        }
+        else
+            done = (uint32_t)r;
+    }
+    else if (!seek_overlapped(f->fd, ov))
     {
         rt_set_last_error(rt_errno_to_win32(errno, ERROR_INVALID_PARAMETER));
         ok = false;
     }
-    while (ok && done < n)
+    while (ok && f->ov == NULL && done < n)
     {
         ssize_t r = read(f->fd, (uint8_t *)G2H(buf) + done, n - done);
         if (r < 0)
@@ -751,7 +770,8 @@ void rt_SetFilePointer(_cpu *cpu)
         return;
     }
     {
-        off_t cur = lseek(f->fd, 0, whence == SEEK_SET ? SEEK_SET : whence);
+        off_t cur = whence == SEEK_END && f->ov != NULL ? (off_t)rt_overlay_size(f->ov)
+                                                        : lseek(f->fd, 0, whence == SEEK_SET ? SEEK_SET : whence);
         if (cur < 0 || (int64_t)cur + dist < 0)
         {
             rt_object_unref(o);
@@ -791,6 +811,7 @@ void rt_GetFileSize(_cpu *cpu)
         return;
     }
     r = fstat(f->fd, &st);
+    if (r == 0 && f->ov != NULL) st.st_size = (off_t)rt_overlay_size(f->ov);
     rt_object_unref(o);
     if (r != 0)
     {

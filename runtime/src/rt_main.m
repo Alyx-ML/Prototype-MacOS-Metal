@@ -10,6 +10,7 @@
  *   User          the guest user directory (C:\Users\Player)
  *   ProgramData   C:\ProgramData
  *   registry.txt  the emulated registry
+ *   enhancements.txt  the Mac enhancement settings (rt_enh.h)
  *
  * The guest runs on the main thread, because the window system works only
  * on the main thread. The guest message loop handles the native events
@@ -17,6 +18,7 @@
  */
 #include "rt.h"
 #include "rt_crt.h"
+#include "rt_enh.h"
 #include "rt_file.h"
 #include "rt_game.h"
 #include "rt_module.h"
@@ -40,7 +42,7 @@ static bool join_path(char *out, size_t n, const char *dir, const char *name)
 
 _Noreturn void rt_game_main(const char *game_dir)
 {
-    char base[RT_HOST_PATH], user[RT_HOST_PATH], data[RT_HOST_PATH], reg[RT_HOST_PATH];
+    char base[RT_HOST_PATH], user[RT_HOST_PATH], data[RT_HOST_PATH], reg[RT_HOST_PATH], enh[RT_HOST_PATH];
     const char *home = getenv("HOME");
     rt_thread *t;
     uint32_t code;
@@ -52,7 +54,7 @@ _Noreturn void rt_game_main(const char *game_dir)
     if (home == NULL || home[0] != '/') rt_fatal("HOME is not set");
     if (!join_path(base, sizeof base, home, "Library/Application Support/" PORT_NAME) ||
         !join_path(user, sizeof user, base, "User") || !join_path(data, sizeof data, base, "ProgramData") ||
-        !join_path(reg, sizeof reg, base, "registry.txt"))
+        !join_path(reg, sizeof reg, base, "registry.txt") || !join_path(enh, sizeof enh, base, "enhancements.txt"))
         rt_fatal("the home directory path is too long");
     rt_log("game directory %s", game_dir);
 
@@ -66,6 +68,7 @@ _Noreturn void rt_game_main(const char *game_dir)
     rt_modules_init(game_dir);
     rt_fs_init(game_dir, user, data);
     rt_registry_init(reg);
+    rt_enh_init(enh);
     rt_crt_set_command_line("\"" RT_GUEST_GAME_DIR "\\prototypef.exe\"");
     rt_user32_init();
 

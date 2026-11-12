@@ -105,7 +105,7 @@ compile -fobjc-arc -DRT_LOADER_DEV=1 -c "$PORT_DIR/runtime/loader/rt_loader.m" -
 "$LLVM/clang" -target $TRIPLE -fobjc-arc "$LOBJ/rt_loader.o" "$LOBJ/rt_convert.o" \
     -framework Cocoa -framework QuartzCore -framework Metal -framework AudioToolbox -framework CoreAudio \
     -framework GameController -framework CoreHaptics -framework Security -framework CoreFoundation \
-    -framework Foundation -framework CoreGraphics \
+    -framework Foundation -framework CoreGraphics -framework MetalFX \
     -L"$FFMPEG/lib" -lavcodec -lavutil -Wl,-rpath,"$FFMPEG/lib" \
     -o "$APP/Contents/MacOS/Prototype"
 

@@ -1273,3 +1273,142 @@ HUD went into the game. A screenshot at 80 s shows a correct 3D scene
 with correct depth order (Metal HUD: 112 fps, GPU 6.1 ms, Metal memory
 600 MB, application memory 1.34 GB). That run was left open for the
 user.
+
+## 2026-11-12: Mac enhancements in the options screens (18:38)
+
+The user asked for these enhancements, with a row for each in the options
+screens of the game: 16x anisotropic filtering, HDR, a higher shadow
+resolution, MetalFX upscaling, contrast-adaptive sharpening (CAS), SMAA,
+and for DualSense and Xbox controllers: button icons, adaptive triggers and
+better rumble.
+
+Settings:
+
+- `runtime/src/rt_enh.c` and `runtime/include/rt_enh.h` (new): nine
+  settings with a game database key each (`SettingMac...`). The values are
+  in `~/Library/Application Support/Prototype Mac Port/enhancements.txt`.
+  A line that is not valid stops the process with the line number.
+- `runtime/src/rt_main.m`: calls `rt_enh_init` after the registry.
+
+Rendering:
+
+- `runtime/src/rt_d3d9_draw.m`: anisotropic filtering 16 on samplers with
+  mipmaps and linear filtering (not on comparison samplers). The present
+  pass supports an RGBA16Float drawable for HDR. The pass, viewport,
+  scissor and clear rectangles use the size factor of the render target.
+- `runtime/src/rt_d3d9_post.m` (new): SMAA 1x (luma edges, orthogonal
+  search of 32 pixels, analytic area, blending), the MetalFX spatial scaler
+  and CAS. HDR sets the extended linear sRGB color space and EDR on the
+  layer; the highlights use the headroom of the display.
+- `runtime/src/rt_d3d9_res.m`: square render targets and depth-stencil
+  resources of 1024 pixels or more (a power of 2) get the shadow size
+  factor 2 or 4. The setting is read one time per start, because the color
+  and depth surfaces of one pass must have the same factor. Lock,
+  readback, StretchRect, ColorFill, UpdateSurface and UpdateTexture on a
+  scaled surface stop the process with a message that names the setting.
+- `tools/build_app.sh`, `tools/package_release.sh`: link MetalFX.
+
+Controllers:
+
+- `runtime/src/rt_xinput.m`: Enhanced Rumble gives the left motor
+  sharpness 0.1, the right motor sharpness 0.7 and a square-root intensity
+  curve. Adaptive Triggers gives L2 and R2 of a DualSense controller
+  resistance (start 0.25, strength 0.3). While a motor runs, the trigger on
+  the same side vibrates with 8 amplitude steps. `rt_xinput_pad_kind`
+  tells the type of the controller in slot 0.
+
+Engine hooks (`work/engine/instruction_replacements.sci`,
+`runtime/llasm/macros.llinc`, hook functions in `runtime/src/rt_enh.c`):
+
+| Address | Game function | Hook |
+| --- | --- | --- |
+| `0x107F8F00` | db_GetInt (3 arguments) | `rt_enh_db_get_int` |
+| `0x107F9030` | db_SetInt (key, profile index, value, flag) | `rt_enh_db_set_int` |
+| `0x104E0610` | fe_RestoreGameDBDefault (2 arguments) | `rt_enh_db_restore` |
+| `0x104CEDAE` | button icon set switch | `rt_enh_glyph_set` |
+
+For a Mac key, the hook does the call and returns to the caller. For a
+different key, the game function continues. The icon hook changes a
+controller icon value (2 to 10) of `SettingsDefaultController` to 2
+(PlayStation icons) or 4 (Xbox icons) for the connected controller.
+Findings: a replacement must end with the `proc` of the next address. The
+condition of `ctcallz` must be `tmpcnd`. A hook on the thunk at
+`0x100064EC` removed the only reference to `0x104E0610`, so the hook is on
+the first instruction of the function.
+
+Options screens:
+
+- `runtime/src/rt_menu.c` and `runtime/include/rt_menu.h` (new): when the
+  game opens `art.rcf`, the runtime reads five movies, checks their
+  SHA-256 values and patches them in memory.
+  `protooptionsoverlay.gfx` gets the toggle clips. The Video and
+  Controller screens of the main menu and of the pause menu get the rows
+  before `InitializeOptions`. The options list sets the row positions.
+  The Video screens have a gamma preview box. The game shows the gamma
+  row only on Xbox 360 and PS3, but it loads the preview image into
+  `mcGammaImageAnchor` on all platforms. The patch removes the box and the
+  anchor clip, and moves the Video list to the top of the Controller
+  list. The main menu Controller screen moves
+  down by 48 pixels.
+- `runtime/src/rt_file.c`: a read-only handle of `art.rcf` shows the
+  virtual file: the original bytes, the patched movies after the end
+  (2048-byte alignment) and the changed directory entries. `ReadFile`,
+  `SetFilePointer` (end) and `GetFileSize` use the virtual size.
+
+Verification:
+
+- The runtime files and the build had no warnings. The engine was
+  translated and compiled again (0 warnings).
+- A scratch program read the virtual `art.rcf` through
+  `rt_overlay_pread` and wrote the five patched movies. A disassembly of
+  each movie, compared with the original, shows only the inserted rows,
+  the removed clips and the moved overlays. The one branch that ends at
+  an insertion point goes to the inserted code.
+- A headless run with the default settings went into the game and quit at
+  80 s with exit status 0 (140 fps). The log shows the five patched
+  movies.
+- A headless run with all settings on (shadow 4x, HDR, MetalFX, CAS
+  medium, SMAA) went into the game and quit at 80 s with exit status 0
+  (130 fps). The shadow surfaces were 8192 x 8192. The test settings file
+  was then removed.
+
+Not verified (UNCONFIRMED): the look of the pause menu options screens,
+HDR on an EDR display, the result of MetalFX, CAS and SMAA on the screen,
+the button icons, the adaptive triggers and the rumble. These need a
+windowed run in the game and a controller.
+
+### Corrections after the windowed check (19:23)
+
+The user reported that the new rows did not save and had no effect. A
+windowed run with screenshots found two more problems.
+
+1. The settings did not change. The menu script calls
+   `DoCallBack('db_SetInt', key, mProfileIndex, value, index)`. The game
+   function at `0x107F9030` gives its arguments 1 to 3 to the database
+   setter at `0x107F71F0` as (index, value, flag). Thus the value is
+   argument 2. The hook read argument 1 (the profile index, 0), so each
+   change wrote 0. `rt_enh_db_set_int` now reads argument 2.
+2. The gamma preview image covered the top rows of the main menu Video
+   screen. The script loads `protogammaimage.gfx` into
+   `mcGammaImageAnchor` on all platforms. The patch now also removes the
+   anchor clip: depth 29 in `protovideooption.gfx` and depth 35 in
+   `protopausevideo.gfx`. Without the clip, the `Load` and `Unload` calls
+   do nothing.
+3. The labels of the new rows are now in capital letters, as the labels
+   of the game.
+
+Verification:
+
+- The build had no warnings.
+- Windowed run with screenshots: the main menu Video screen shows the 11
+  rows and no image above them. The main menu Controller screen shows the
+  3 new rows below the rows of the game. A right arrow changed SMAA to ON.
+- Headless run with a temporary log line in the hook: the hook received
+  (profile 0, value 1, flag 0) for SMAA and (0, 1, 0) and (0, 2, 0) for
+  Sharpening. The settings file then had `SettingMacSMAA 1` and
+  `SettingMacSharpening 2`. The log line was then removed.
+- Next headless run: the left arrow changed SMAA from 1 to 0 and
+  Sharpening from 2 to 1 to 0. Thus the values loaded from the file at the
+  start. The test settings file was then removed.
+- Two of the headless runs did not reach the Video screen, because the
+  title screen took more time. These runs changed nothing.

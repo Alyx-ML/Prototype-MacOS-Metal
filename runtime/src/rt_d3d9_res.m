@@ -18,6 +18,9 @@
  *     touch data that the GPU uses, so there is no wait.
  */
 #import "rt_d3d9_int.h"
+#include "rt_enh.h"
+
+#include <stdatomic.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -302,6 +305,36 @@ static MTLTextureDescriptor *texture_desc(D3DDevice *d, const d3d_format *f, boo
     return td;
 }
 
+uint32_t d3d_shadow_scale(uint32_t usage, uint32_t w, uint32_t h, bool cube)
+{
+    /* The setting is read once: the shadow color and depth surfaces of one
+       pass must have the same scale, so a change in the options screen
+       applies at the next start of the game. */
+    static _Atomic int latched = -1;
+    int v = atomic_load_explicit(&latched, memory_order_relaxed);
+    uint32_t sc;
+    if (!(usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)) || cube || w != h || w < 1024u || (w & (w - 1u)) != 0)
+        return 1;
+    if (v < 0)
+    {
+        int expected = -1;
+        v = rt_enh_get(RT_ENH_SHADOW_RES);
+        if (!atomic_compare_exchange_strong_explicit(&latched, &expected, v, memory_order_relaxed, memory_order_relaxed))
+            v = expected;
+    }
+    sc = 1u << v;
+    while (sc > 1 && w * sc > 16384u) sc >>= 1;
+    return sc;
+}
+
+void d3d_check_unscaled(D3DSurface *s, const char *what)
+{
+    if (s->scale > 1)
+        rt_fatal("D3D9: %s of a %ux%u surface that has the shadow resolution enhancement (%ux) is not supported; set "
+                 "\"Shadow Resolution\" to \"Game\" in the Video options",
+                 what, s->width, s->height, s->scale);
+}
+
 uint32_t d3d_create_texture(D3DDevice *d, bool cube, uint32_t w, uint32_t h, uint32_t levels, uint32_t usage,
                             uint32_t fmt, uint32_t pool, uint32_t out)
 {
@@ -342,6 +375,7 @@ uint32_t d3d_create_texture(D3DDevice *d, bool cube, uint32_t w, uint32_t h, uin
     t->retired = [NSMutableArray new];
     t->autogen_filter = 2; /* D3DTEXF_LINEAR */
     t->depth = 1;
+    t->scale = pool == D3DPOOL_DEFAULT ? d3d_shadow_scale(usage, w, h, cube) : 1u;
     for (l = 0; l < levels; l++)
     {
         t->lw[l] = w >> l ? w >> l : 1u;
@@ -363,12 +397,16 @@ uint32_t d3d_create_texture(D3DDevice *d, bool cube, uint32_t w, uint32_t h, uin
     }
     else
     {
-        t->tex = [d->mtl newTextureWithDescriptor:texture_desc(d, f, cube, w, h, mtl_levels, usage, 1)];
+        t->tex = [d->mtl newTextureWithDescriptor:texture_desc(d, f, cube, w * t->scale, h * t->scale, mtl_levels, usage, 1)];
         if (t->tex == nil) return D3DERR_OUTOFVIDEOMEMORY;
     }
     o = make_object(cube ? &d3d_cube_class : &d3d_texture_class, t);
     t->com = o;
     write_iface(o, out);
+    if (usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL))
+        rt_log("D3D9: %s%s texture %ux%u, format 0x%08x, %u levels%s", cube ? "cube " : "",
+               (usage & D3DUSAGE_DEPTHSTENCIL) ? "depth-stencil" : "render target", w, h, fmt, levels,
+               t->scale == 4 ? ", 4x shadow resolution" : t->scale == 2 ? ", 2x shadow resolution" : "");
     return D3D_OK;
 }
 
@@ -541,7 +579,7 @@ static void upload_level(D3DDevice *d, D3DTexture *t, uint32_t fc, uint32_t l, b
             }
             if (nt == nil)
             {
-                MTLTextureDescriptor *td = texture_desc(d, f, false, t->width, t->height, 1, t->usage, 1);
+                MTLTextureDescriptor *td = texture_desc(d, f, false, t->width * t->scale, t->height * t->scale, 1, t->usage, 1);
                 nt = [d->mtl newTextureWithDescriptor:td];
                 if (nt == nil) rt_fatal("D3D9: out of video memory (dynamic texture)");
             }
@@ -569,6 +607,9 @@ static void upload_level(D3DDevice *d, D3DTexture *t, uint32_t fc, uint32_t l, b
 
 static uint32_t tex_lock(D3DTexture *t, uint32_t fc, uint32_t l, uint32_t locked_rect, uint32_t rect, uint32_t flags)
 {
+    if (t->scale > 1)
+        rt_fatal("D3D9: LockRect of a %ux%u texture that has the shadow resolution enhancement (%ux) is not supported; "
+                 "set \"Shadow Resolution\" to \"Game\" in the Video options", t->width, t->height, t->scale);
     uint32_t off = 0;
     if (l >= t->levels || locked_rect == 0) return D3DERR_INVALIDCALL;
     if (t->usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)) return D3DERR_INVALIDCALL;
@@ -732,6 +773,7 @@ static uint32_t child_surface(D3DTexture *t, uint32_t fc, uint32_t l, uint32_t o
         s->pool = t->pool;
         s->width = t->lw[l];
         s->height = t->lh[l];
+        s->scale = t->scale;
         so = make_object(&d3d_surface_class, s);
         s->com = so;
         t->surf[fc][l] = so;
@@ -919,6 +961,7 @@ uint32_t d3d_create_surface(D3DDevice *d, uint32_t w, uint32_t h, uint32_t fmt, 
     s->msaa = msaa;
     s->msaa_quality = quality;
     s->lockable = lockable;
+    s->scale = pool == D3DPOOL_DEFAULT && !lockable ? d3d_shadow_scale(usage, w, h, false) : 1u;
     level_layout(f, w, h, &s->pitch, &(uint32_t){ 0 });
     if (pool == D3DPOOL_SYSTEMMEM || pool == D3DPOOL_SCRATCH)
     {
@@ -929,11 +972,15 @@ uint32_t d3d_create_surface(D3DDevice *d, uint32_t w, uint32_t h, uint32_t fmt, 
     }
     else
     {
-        s->tex = [d->mtl newTextureWithDescriptor:texture_desc(d, f, false, w, h, 1, usage, samples)];
+        s->tex = [d->mtl newTextureWithDescriptor:texture_desc(d, f, false, w * s->scale, h * s->scale, 1, usage, samples)];
         if (s->tex == nil) return D3DERR_OUTOFVIDEOMEMORY;
     }
     *out_obj = make_object(&d3d_surface_class, s);
     s->com = *out_obj;
+    if (usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL))
+        rt_log("D3D9: %s surface %ux%u, format 0x%08x, %u samples%s",
+               (usage & D3DUSAGE_DEPTHSTENCIL) ? "depth-stencil" : "render target", w, h, fmt, msaa,
+               s->scale == 4 ? ", 4x shadow resolution" : s->scale == 2 ? ", 2x shadow resolution" : "");
     return D3D_OK;
 }
 
@@ -1161,6 +1208,7 @@ void rt_com_D3DSurface9_LockRect(_cpu *cpu)
     D3DSurface *s = d3d_surf(d3d_surface_from_ptr(ARG(0)));
     D3DDevice *d = s->dev;
     uint32_t lr = ARG(1), rect = ARG(2), flags = ARG(3), off = 0, rows;
+    d3d_check_unscaled(s, "LockRect");
     d3d_lock(d);
     if (s->ctex != nil)
     {
@@ -1246,6 +1294,7 @@ static bool sysmem_of(D3DSurface *s, uint32_t *mem, uint32_t *pitch)
 
 uint32_t d3d_readback(D3DDevice *d, D3DSurface *src, D3DSurface *dst)
 {
+    d3d_check_unscaled(src, "GetRenderTargetData");
     uint32_t mem, pitch;
     NSUInteger slice, level;
     id<MTLTexture> tex = d3d_surface_texture(src, &slice, &level);
@@ -1260,6 +1309,7 @@ uint32_t d3d_update_surface(D3DDevice *d, D3DSurface *src, uint32_t src_rect, D3
 {
     uint32_t mem, pitch, x0 = 0, y0 = 0, w = src->width, h = src->height, dx = 0, dy = 0, off;
     NSUInteger slice, level;
+    d3d_check_unscaled(dst, "UpdateSurface");
     id<MTLTexture> tex = d3d_surface_texture(dst, &slice, &level);
     if (tex == nil || dst->pool != D3DPOOL_DEFAULT || src->fmt != dst->fmt || !sysmem_of(src, &mem, &pitch))
         return D3DERR_INVALIDCALL;
@@ -1287,6 +1337,9 @@ uint32_t d3d_update_texture(D3DDevice *d, D3DTexture *src, D3DTexture *dst)
 {
     uint32_t faces = src->cube ? 6u : 1u, fc, l, n;
     if (src->volume || dst->volume) rt_fatal("D3D9: UpdateTexture with a volume texture is not supported");
+    if (dst->scale > 1)
+        rt_fatal("D3D9: UpdateTexture of a %ux%u texture that has the shadow resolution enhancement (%ux) is not supported; "
+                 "set \"Shadow Resolution\" to \"Game\" in the Video options", dst->width, dst->height, dst->scale);
     if ((src->pool != D3DPOOL_SYSTEMMEM) || dst->pool != D3DPOOL_DEFAULT || src->cube != dst->cube ||
         src->fmt != dst->fmt || dst->tex == nil)
         return D3DERR_INVALIDCALL;

@@ -1,2 +1,8 @@
 ;; Game-specific llasm macros for the Prototype engine.
 ;; SRW Windows output uses only the macros in SR/llasm-support.
+
+;; Mac enhancement hooks (runtime/src/rt_enh.c, instruction_replacements.sci).
+funcv rt_enh_db_get_int $
+funcv rt_enh_db_set_int $
+funcv rt_enh_db_restore $
+funcv rt_enh_glyph_set $

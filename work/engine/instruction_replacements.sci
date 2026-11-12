@@ -1,2 +1,6 @@
 loc_1062E45B,5,;call loc_1062E1B0 (return lands in int3 padding)|PUSH loc_1062E460|tcall loc_1062E1B0|endp|proc loc_1062E460
 loc_1062E460,16,;int3 padding reached only if loc_1062E1B0 returns|INT 3|tcall loc_1062E470|endp
+loc_107F8F00,3,;sub esp, 0x10 (db_GetInt: Mac enhancement keys go to rt_enh)|call rt_enh_db_get_int $|mov tmpcnd, edx|ctcallz tmpcnd, loc_107F8F00_game|tcall ecx|endp|proc loc_107F8F00_game|sub esp, esp, 16|tcall loc_107F8F03|endp|proc loc_107F8F03
+loc_107F9030,4,;mov eax, [esp+0x10] (db_SetInt: Mac enhancement keys go to rt_enh)|call rt_enh_db_set_int $|mov tmpcnd, edx|ctcallz tmpcnd, loc_107F9030_game|tcall ecx|endp|proc loc_107F9030_game|add tmpadr, esp, 16|load eax, tmpadr, 4|tcall loc_107F9034|endp|proc loc_107F9034
+loc_104CEDAE,9,;cmp eax, 0xa; ja near loc_104CEF69 (button icon set: Mac Button Icons setting)|call rt_enh_glyph_set $|cmovugt eax, 10, tmpcnd, 0, 1|ctcallz tmpcnd, loc_104CEF69|tcall loc_104CEDB7|endp|proc loc_104CEDB7
+loc_104E0610,4,;mov eax, [esp+0x4] (fe_RestoreGameDBDefault: Mac enhancement keys go to rt_enh)|call rt_enh_db_restore $|mov tmpcnd, edx|ctcallz tmpcnd, loc_104E0610_game|tcall ecx|endp|proc loc_104E0610_game|add tmpadr, esp, 4|load eax, tmpadr, 4|tcall loc_104E0614|endp|proc loc_104E0614

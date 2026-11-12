@@ -192,6 +192,7 @@ const d3d_format *d3d_format_find(uint32_t fmt);
     rt_com_object *surf[6][16];    /* child surfaces (GetSurfaceLevel) */
     uint64_t last_use;
     uint32_t lod, priority, autogen_filter;
+    uint32_t scale;                /* Metal size = scale * D3D size (d3d_shadow_scale) */
 }
 @end
 
@@ -212,6 +213,7 @@ const d3d_format *d3d_format_find(uint32_t fmt);
     bool locked;
     uint32_t lock_flags;
     uint64_t last_use;
+    uint32_t scale;           /* Metal size = scale * D3D size (d3d_shadow_scale) */
 }
 @end
 
@@ -298,7 +300,8 @@ typedef struct d3d_stream {
     bool enc_draws;
     /* Attachments of the render pass in enc. */
     MTLPixelFormat pass_color[D3D_MAX_RT], pass_depth, pass_stencil;
-    uint32_t pass_samples, pass_w, pass_h;
+    uint32_t pass_samples, pass_w, pass_h; /* pass_w, pass_h: Metal pixels */
+    uint32_t pass_scale; /* Metal pixels for each D3D pixel (d3d_shadow_scale) */
     bool pass_srgb;
     uint64_t present_serial[D3D_FRAMES_IN_FLIGHT];
     uint32_t present_count;
@@ -310,7 +313,8 @@ typedef struct d3d_stream {
     uint16_t gamma[3][256];
     bool gamma_set;
     id<MTLTexture> gamma_tex;
-    id<MTLRenderPipelineState> present_pso;
+    id<MTLRenderPipelineState> present_pso, present_pso_hdr; /* drawable BGRA8Unorm, RGBA16Float (HDR) */
+    id post; /* the post-processing state (rt_d3d9_post.m) */
     id<MTLSamplerState> present_linear, present_point;
     id<MTLLibrary> builtin_lib;
     uint32_t cursor_x, cursor_y;
@@ -568,6 +572,13 @@ extern const rt_com_class d3d_device_class;
 void d3d_draw_init(D3DDevice *d);
 /* Present the back buffer to the window layer and commit the frame. */
 void d3d_present(D3DDevice *d);
+/* Post-processing of the presented frame (rt_d3d9_post.m). Returns the
+   texture that the present pass samples; out_w and out_h are the size of the
+   image in the drawable. */
+id<MTLTexture> d3d_post_process(D3DDevice *d, id<MTLTexture> src, uint32_t out_w, uint32_t out_h);
+/* Sets the layer for the HDR setting and returns the EDR headroom of the
+   display (1 when the display has none). */
+float d3d_post_hdr_begin(D3DDevice *d);
 /* Resource classes (rt_d3d9_res.m). */
 extern const rt_com_class d3d_texture_class, d3d_cube_class, d3d_volume_class, d3d_surface_class, d3d_vb_class, d3d_ib_class,
     d3d_decl_class, d3d_vs_class, d3d_ps_class, d3d_query_class;
@@ -595,6 +606,20 @@ static inline D3DSurface *d3d_surf(rt_com_object *o) { return (__bridge D3DSurfa
 static inline D3DBuffer *d3d_buf(rt_com_object *o) { return (__bridge D3DBuffer *)o->data; }
 static inline D3DDecl *d3d_decl(rt_com_object *o) { return (__bridge D3DDecl *)o->data; }
 static inline D3DShader *d3d_shader_obj(rt_com_object *o) { return (__bridge D3DShader *)o->data; }
+
+/* Mac enhancement shadow resolution (rt_enh.h RT_ENH_SHADOW_RES): the size
+   factor of the Metal texture of a new render target or depth-stencil
+   resource. The game draws its shadow map into a square depth-stencil
+   texture (2048x2048) with a square color surface of the same size; the
+   other render targets have the back buffer size. A square render target or
+   depth-stencil resource of 1024 or more pixels, a power of 2, gets the
+   factor 2 or 4; the D3D size that the game sees does not change. The
+   function reads the setting one time, at the first such resource, so a
+   change applies at the next start of the game. */
+uint32_t d3d_shadow_scale(uint32_t usage, uint32_t w, uint32_t h, bool cube);
+/* Stops the process if a scaled surface is used by an operation that has no
+   scaled form. */
+void d3d_check_unscaled(D3DSurface *s, const char *what);
 
 /* The Metal texture of a surface and its slice/level. */
 id<MTLTexture> d3d_surface_texture(D3DSurface *s, NSUInteger *slice, NSUInteger *level);

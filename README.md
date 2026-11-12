@@ -155,6 +155,52 @@ sh tools/run_tests.sh
 
 Some tests use Metal or open a local network port. Run them outside a sandbox.
 
+## Mac enhancements
+
+The port adds rows to the options screens of the game. The rows are in the
+main menu and in the pause menu. The runtime adds the rows when the game
+reads `art.rcf`. The file on disk does not change.
+
+| Screen | Row | Values | Default |
+| --- | --- | --- | --- |
+| Video | Anisotropic Filtering | Game, 16x | 16x |
+| Video | HDR | Off, On | Off |
+| Video | Shadow Resolution (restart) | Game, 2x, 4x | Game |
+| Video | MetalFX Upscaling | Off, On | Off |
+| Video | Sharpening (CAS) | Off, Low, Medium, High | Off |
+| Video | SMAA Anti-Aliasing | Off, On | Off |
+| Controller | Button Icons | Game, Controller | Controller |
+| Controller | Adaptive Triggers (DualSense) | Off, On | On |
+| Controller | Enhanced Rumble | Off, On | On |
+
+- Anisotropic Filtering sets 16x filtering on each texture that has mipmaps
+  and linear filtering.
+- HDR shows the game on an EDR display (extended dynamic range). Bright
+  areas use the headroom of the display. A display without headroom shows
+  the image as before.
+- Shadow Resolution makes the shadow maps 2 or 4 times larger in each
+  direction. The new value applies at the next start of the game.
+- MetalFX Upscaling scales the image to the size of the window with the
+  MetalFX spatial scaler. It has an effect only when the game resolution is
+  smaller than the window.
+- Sharpening is contrast-adaptive sharpening (CAS).
+- SMAA is the SMAA 1x method with the "low" quality steps: edge detection
+  on luma, orthogonal search of 32 pixels and blending. It has no diagonal
+  or corner detection.
+- Button Icons shows the PlayStation or the Xbox button icons for the
+  controller that has the first player slot.
+- Adaptive Triggers gives light resistance on L2 and R2 of a DualSense
+  controller. While a motor runs, the trigger on the same side vibrates.
+- Enhanced Rumble gives the left motor a soft haptic and the right motor a
+  sharp haptic, and makes weak vibration stronger.
+
+The runtime keeps these values in
+`~/Library/Application Support/Prototype Mac Port/enhancements.txt`.
+
+The menu patch supports only the movies of the Steam release. If
+`art.rcf` has different movies, the game stops with a message that names
+the movie.
+
 ## Settings and saved games
 
 The game writes its settings, saved games and registry values into

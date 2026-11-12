@@ -155,7 +155,7 @@ done
 "$LLVM/clang" -target $TRIPLE -fobjc-arc "$OBJ/loader_rt_loader.o" "$OBJ/loader_rt_convert.o" \
     -framework Cocoa -framework QuartzCore -framework Metal -framework AudioToolbox -framework CoreAudio \
     -framework GameController -framework CoreHaptics -framework Security -framework CoreFoundation \
-    -framework Foundation -framework CoreGraphics \
+    -framework Foundation -framework CoreGraphics -framework MetalFX \
     "$FRAMEWORKS/libavcodec.dylib" "$FRAMEWORKS/libavutil.dylib" -Wl,-rpath,@executable_path/../Frameworks \
     -o "$APP/Contents/MacOS/Prototype"
 
