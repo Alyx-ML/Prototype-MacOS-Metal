@@ -1412,3 +1412,441 @@ Verification:
   start. The test settings file was then removed.
 - Two of the headless runs did not reach the Video screen, because the
   title screen took more time. These runs changed nothing.
+
+## 2026-11-12: Field of view, XeGTAO ambient occlusion and PCSS soft shadows (20:21)
+
+The user asked for XeGTAO ambient occlusion, soft shadows and a field of
+view setting. The Video screens now have three more rows: "Field of View",
+"Ambient Occlusion (XeGTAO)" and "Soft Shadows (PCSS)". The user stopped
+all game runs for this work. Thus none of this code has run in the game.
+The behavior in the game is UNCONFIRMED.
+
+Soft shadows use PCSS (percentage-closer soft shadows). The screen-space
+shadows of Bend Studio need the direction of the sun in screen space for
+each frame. The game gives no such value to the shaders.
+
+### Field of view
+
+The chase camera keeps its field of view in radians at `+0xC74`. The
+function at `0x10338FF0` gives the value to the render camera. Two
+instruction replacements in `work/engine/instruction_replacements.sci`
+call the runtime:
+
+| Address | Hook | Effect |
+| --- | --- | --- |
+| `0x10338FF0` | `rt_enh_fov_add` | Adds 5 degrees for each step of the setting to the value (largest result 170 degrees). |
+| `0x1033A579` | `rt_enh_fov_force` | Sets BL to 1 after a change of the setting, so the camera update gives the value again. |
+
+The engine translation added two flag entries for the new block at
+`0x1033A57B` (`work/engine/instruction_flags.sci`). The second pass of the
+flag check had no errors.
+
+### Ambient occlusion
+
+`runtime/src/rt_d3d9_ao.m` is a Metal port of XeGTAO (Intel, MIT
+license). The shader parser reads the constant table of each shader. The
+camera projection comes from `p3dWorldViewProjectionMatrix` and
+`p3dWorldMatrix` of the scene draws into the full-size depth buffer. The
+occlusion passes run before the composite draw (the pixel shader with
+`p3dFrameBufferCurrent`, `BloomedScene` and `BloomStrength`). The result
+multiplies the scene texture. A multisampled depth-stencil texture now has
+shader-read usage, so that the pass can read sample 0.
+
+### PCSS
+
+The pixel shader translator replaces each comparison sample of a depth
+texture with a PCSS function: a blocker search, a penumbra estimate and a
+filter. The low level uses 8 and 8 samples and a radius of up to 4 texels.
+The high level uses 16 and 16 samples and up to 8 texels. The samples stay
+in the 2x2 cell of the shadow atlas of the center sample. The cell layout
+is UNCONFIRMED.
+
+### Verification
+
+- The engine translation and compilation completed without errors.
+- Each changed runtime file compiled with `-Werror`.
+- The Metal source of the occlusion passes and the generated PCSS function
+  compiled with `xcrun metal`.
+- `tools/build_app.sh` completed with no warnings.
+
+Not verified (UNCONFIRMED): the field of view in the game, the camera
+capture, the occlusion result on the screen, the PCSS result and its
+performance, and the fit of 9 rows on the Video screens.
+
+## 2026-11-12: Faster ambient occlusion and PCSS (no change to the result)
+
+The user asked for faster ambient occlusion and soft shadows without a
+loss of quality. These changes keep the calculation of each pixel:
+
+1. Depth prefilter: one dispatch makes the five depth mips. Before, each
+   mip had its own dispatch and read the previous mip from memory. A group
+   of 8x8 threads covers 16x16 pixels and keeps mips 2 to 4 in threadgroup
+   memory. For sizes that are a multiple of 16 (for example 2560x1600),
+   the mips have the same values as before. At an odd mip size, only the
+   last row and column can differ.
+2. Main pass: the sample distribution power is always 2, so `pow` is now
+   a multiplication.
+3. Denoise and apply: the second denoise pass is now the fragment shader
+   of the multiply into the scene. Before, it wrote a full-size 16-bit
+   texture that the multiply then read. The visibility value is now not
+   rounded to 16 bits before the multiply.
+4. PCSS blocker search: gathers (4 texels in each fetch) replace point
+   samples. The low level reads 16 texels in 4 fetches (before: 8 texels
+   in 8 fetches). The high level reads 32 texels in 8 fetches (before:
+   16 in 16). The filter samples did not change. The blocker depth now
+   comes from more texels, so the result is not the same as before. It is
+   not of lower quality. The gathers stay in the 2x2 atlas cell of the
+   center sample.
+
+Verification:
+
+- The occlusion Metal source and the generated PCSS function at both
+  levels compiled with `xcrun metal`. The first compile found that the
+  name `mip_filter` is also a Metal enum. The function is now
+  `depth_filter`.
+- `rt_d3d9_ao.m` and `rt_d3d9_shader.c` compiled with `-Werror`.
+- `tools/build_app.sh` completed with no warnings.
+
+Not verified (UNCONFIRMED): the speed change and the result on the
+screen. No game run was done.
+
+## 2026-11-12: GT7 tone mapping, dual Kawase bloom and Bend contact shadows (20:59)
+
+The user asked for three new Video settings. Each setting is off (or
+"Game") by default.
+
+1. Tone Mapping (`SettingMacToneMapping`, Game or GT7). The present shader
+   in `rt_d3d9_draw.m` applies the GT7 tone mapping of Polyphony Digital
+   to the final image. The shader changes the sRGB image to linear Rec.2020
+   values. Then it applies the GT7 curve to each channel and blends that
+   result 60:40 with an ICtCp result. The ICtCp result has the intensity of
+   the curve and the chroma of the input. The game's white (1.0) is the
+   GT7 SDR paper white (250 nits). With HDR on, the shader applies the EDR
+   expansion first. The peak of the curve is then the paper white times
+   the EDR headroom. `d3d_post_gt7` (`rt_d3d9_post.m`) calculates the
+   curve constants for each frame.
+2. Bloom (`SettingMacKawaseBloom`, Game or Kawase). `rt_d3d9_bloom.m`
+   keeps the render target of the game's bright pass (CTAB role
+   `D3DSH_ROLE_BLOOM_BRIGHT`). It skips the draws of the game's 11-tap
+   blur shader (`D3DSH_ROLE_BLOOM_BLUR`). Before the composite draw, it
+   writes a dual Kawase blur of the bright-pass target into the
+   BloomedScene texture. The blur has four half-size passes down and four
+   passes up. The intermediate textures are RGBA16Float. The composite
+   applies the game's BloomStrength as before.
+3. Contact Shadows (`SettingMacContactShadows`, Off or On).
+   `rt_d3d9_sss.m` is a Metal port of the screen-space shadows of Bend
+   Studio (Apache License 2.0). The CPU dispatch list and the GPU shader
+   follow the reference code. The parameters are the recommended start
+   values: 60 samples, 4 hard samples, 8 fade-out samples, surface
+   thickness 0.005, bilinear threshold 0.02, contrast 4. The sun vector
+   comes from the depth row of `p3dShadowMapMatrix`. The code finds from
+   two draws with different world matrices if the matrix is a world-space
+   or an object-space matrix. The camera comes from `d3d_ao_capture`. The
+   first draw of a frame that reads the shadow map into a full-size target
+   calculates the contact shadows into an R8 texture. The pixel shader
+   variants of these draws multiply each shadow map comparison by the
+   contact shadow (texture 16). The pipeline key and the pixel shader key
+   have a new contact bit. Thus the contact shadows darken only the sun
+   light.
+
+The menu has three new rows: CONTACT SHADOWS (BEND), BLOOM and TONE
+MAPPING.
+
+Verification:
+
+- `rt_d3d9_draw.m`, `rt_d3d9_post.m`, `rt_d3d9_sss.m`, `rt_d3d9_bloom.m`,
+  `rt_d3d9_ao.m`, `rt_d3d9_shader.c`, `rt_d3d9_res.m`, `rt_menu.c` and
+  `rt_enh.c` compiled with `-Werror`.
+- The Metal sources of the present shader (with GT7), the bloom shader and
+  the contact shadow shader compiled with `xcrun metal`.
+- `tools/build_app.sh` completed with no warnings.
+
+Not verified (UNCONFIRMED). No game run was done.
+
+- The result on the screen of the three settings.
+- The contact-shadow pixel shader variant from the translator. It compiles
+  only at run time.
+- The sun direction: the sign of the depth row and the world-space or
+  object-space detection.
+- The bloom: that the glow sprites go into the bright-pass target, that
+  the skipped blur draws write only the BloomedScene texture, and the
+  brightness compared with the game's blur.
+- GT7 on the 8-bit final image: the curve compresses the game's white to
+  approximately 0.84.
+- The fit of the 12 Mac rows in the Video menu.
+
+## 2026-11-12: Contact shadow row label
+
+The user asked to remove the word "Bend" from the menu row. The Video row
+is now CONTACT SHADOWS (`runtime/src/rt_menu.c`). The README settings
+table has the same name. The license lines in the README and the notice
+in `rt_d3d9_sss.m` still name Bend Studio, because the Apache License 2.0
+requires the attribution.
+
+## 2026-11-12: Cheaper and better-looking AO, contact shadows, bloom and GT7
+
+The user asked for lower cost without a loss of quality, and for visual
+improvements. These are the changes:
+
+1. Contact shadows (`rt_d3d9_sss.m`):
+   - Early-out: a pixel at the far depth (sky) skips the 60-sample loop
+     and writes 1 (no shadow). Its depth is still in threadgroup memory
+     for the other pixels of the line.
+   - Bilinear sampling offset mode of Bend Studio: the depth between the
+     two texels of the line, except at an edge. The shadow edges are
+     smoother.
+   - Fade out between 40 and 80 world units of view distance.
+     `d3d_ao_camera` now also gives P22 and P23 for the view depth.
+2. GT7 (`rt_d3d9_draw.m`, `rt_d3d9_post.m`):
+   - The inverse color matrices are constants. Before, the shader
+     calculated two 3x3 inverses for each pixel.
+   - The tone mapping is a new full-screen draw (`gt7_scene_fs`, framebuffer
+     fetch) in the same render pass, after the game's bloom composite
+     draw. The HUD that the game draws next does not go through the curve.
+     The present shader has no GT7 code now.
+   - Highlight expansion before the curve: factor `expand` at white (by
+     luminance to the power of 4). The game's white now comes out at 0.98
+     and not at 0.84. In HDR mode the present shader expands the
+     tone-mapped image to the EDR headroom as before. The GT7 peak no
+     longer follows the headroom, because the scene target has 8 bits.
+3. Bloom (`rt_d3d9_bloom.m`):
+   - The first down pass is the 13-tap filter of Jimenez (2014) with the
+     Karis average.
+   - Five levels (before: four).
+   - The up passes add to each level (additive blend). The output is the
+     sum of the five levels divided by five.
+4. Ambient occlusion (`rt_d3d9_ao.m`):
+   - The slice loop of the main pass uses half precision for the
+     directions, the angles and the horizon cosines, as the half-precision
+     option of XeGTAO. Positions, distances and sample offsets stay in
+     float.
+   - The apply pass reads the scene pixel (framebuffer fetch) and applies
+     the GTAO multi-bounce approximation, with the scene color as the
+     albedo. The multiply blend is removed.
+
+Verification:
+
+- The five changed files compiled with `-Werror`.
+- The Metal sources of AO, bloom, contact shadows and the built-in
+  library compiled with `xcrun metal` with no warnings. The script that
+  extracts the sources from the C strings stopped at the first semicolon
+  at the end of a comment line. Thus the earlier checks of these sources
+  were not complete. The script now stops at the end of the string, and
+  all the sources are complete in this check.
+- `tools/build_app.sh` completed with no warnings.
+
+Not verified (UNCONFIRMED). No game run was done.
+
+- The result on the screen and the change in speed.
+- That the game draws no scene content after the bloom composite (that
+  content would not get the GT7 curve).
+- The fade distances (one world unit is assumed to be one meter).
+- The multi-bounce result with the lit scene color as the albedo.
+
+## 2026-11-12: GT7 in HDR mode and the contact shadow size check
+
+The user reported that GT7 had no visible effect after the scene-pass
+change. The user's HDR setting is on.
+
+Cause (from the code and the game log): the scene pass applied the SDR
+form of GT7 to the 8-bit scene. With the paper white at the peak and the
+highlight expansion before the curve, that form is almost the identity
+for mid tones and highlights. Before the scene-pass change, GT7 applied
+after the EDR expansion with the peak at the EDR headroom, which gives a
+visible shoulder and chroma fade.
+
+Correction:
+
+- With HDR on, the scene pass does not run. The present shader applies
+  GT7 after the EDR expansion, with the peak at the headroom (the earlier
+  behavior). The HUD then also goes through the curve. A frame that had the
+  scene pass does not get GT7 again in the present shader (the HDR layer
+  changes on the main thread, so one frame can have the old format).
+- With HDR off, the scene pass runs as before. It writes one log line.
+- `d3d_post_gt7` has the `hdr` and `headroom` arguments again.
+
+The same log had no message from the contact shadows. The function
+returned before its log messages when the render target did not have the
+size of the back buffer. The check now compares the target with the scene
+depth buffer of the camera, and a mismatch writes one log line. A draw
+into a target of a different size does not get the contact shadow
+texture.
+
+Verification: `rt_d3d9_draw.m`, `rt_d3d9_post.m` and `rt_d3d9_sss.m`
+compiled with `-Werror`. The built-in library and the contact shadow
+shader compiled with `xcrun metal`. `tools/build_app.sh` completed with no
+warnings. Not verified (UNCONFIRMED): the result on the screen; that the
+back buffer size was the cause of the missing contact shadows.
+
+## 2026-11-12: Anisotropic filtering always 16x; Video menu fit
+
+The user asked for 16x anisotropic filtering at all times, with no menu
+row, and reported that the last Video row (TONE MAPPING) was cut off.
+
+- `rt_enh.h`, `rt_enh.c`: the setting `SettingMacAnisotropic` is removed.
+  `rt_enh_init` ignores its line in an existing settings file; the next
+  save writes the file without it.
+- `rt_d3d9_draw.m`: each mipmapped sampler with linear filtering gets 16x
+  anisotropic filtering. Point-filtered and depth-comparison samplers
+  keep the game setting, as before.
+- `rt_menu.c`: the ANISOTROPIC FILTERING row is removed. The Video screen
+  now has 11 Mac rows, so the last row is 30 pixels higher.
+
+The game log of the previous run shows that the contact shadows now run
+("Bend contact shadows 2560x1600") and that p3dShadowMapMatrix is a
+world-space matrix.
+
+Verification: `rt_enh.c`, `rt_menu.c` and `rt_d3d9_draw.m` compiled with
+`-Werror`. `tools/build_app.sh` completed with no warnings. Not verified
+(UNCONFIRMED): that the 11 rows fit in the panel.
+
+## 2026-11-12: Shadow pass bandwidth, HDR back buffer and SMAA high
+
+The user asked for four changes: no saved color target in the shadow
+pass, no stencil traffic for the shadow maps, a 16-bit float scene target
+for GT7 in HDR mode, and the SMAA "high" preset.
+
+- `rt_d3d9_int.h`, `rt_d3d9_res.m`, `rt_d3d9_draw.m` (shadow color target):
+  a standalone color render target with a shadow resolution scale above 1
+  gets a memoryless texture (`D3DSurface.discard`). No path can read it:
+  `d3d_check_unscaled` stops each read, and a standalone surface is not a
+  texture. Its passes use the load action Clear or DontCare and the store
+  action DontCare. It gets no sRGB view. The surface log line shows
+  "memoryless".
+- `rt_d3d9_int.h`, `rt_d3d9_res.m`, `rt_d3d9_draw.m` (shadow stencil): the
+  Metal format of D3DFMT_D24S8 has stencil, so the format does not change.
+  A depth-stencil surface with stencil and a scale above 1 starts with
+  `D3DSurface.stencil_idle`. Its passes do not load or store the stencil.
+  `stencil_value` keeps the value of the last full stencil clear. Before
+  the first draw with the stencil test or the first stencil clear quad,
+  `need_stencil` clears the flag, logs one line, and starts the pass again
+  with a stencil clear to that value. After that, the passes load and
+  store the stencil as before.
+- `rt_d3d9_draw.m`, `rt_d3d9_res.m`, `rt_d3d9_post.m`, `rt_d3d9_int.h`
+  (HDR back buffer): with HDR and GT7 on, `d3d_present` changes the back
+  buffer texture to RGBA16Float after the frame (`backbuffer_format`,
+  `D3DSurface.hdr`). The contents go into the new texture. The values stay
+  gamma-encoded. The GT7 scene pass (`gt7_scene_fs`, `GT7P.hdr`) then
+  applies the EDR expansion and GT7 with the HDR peak, and writes values
+  above 1. The present shader only decodes such a frame (`scene`), so the
+  HUD stays at SDR white. A frame without the scene pass gets the
+  expansion and GT7 in the present shader, as before. The gamma ramp keeps
+  the part above 1. `d3d_post_headroom` gives the scene pass the last
+  headroom. StretchRect and GetRenderTargetData from the float back
+  buffer read an 8-bit copy (`d3d_hdr_sdr_copy`). UpdateSurface into it
+  and sRGB writes to it stop with `rt_fatal` and a message. The sharpening
+  result is not clipped at 1. With HDR or GT7 off, the back buffer goes
+  back to its 8-bit format.
+- `rt_d3d9_post.m`, `rt_d3d9_ao.m` (SMAA): corner detection with the SMAA
+  corner rounding 25, and depth predication with the SMAA values
+  (threshold 0.01, scale 2, strength 0.4). The predication compares the
+  view depth from the frame camera (`d3d_ao_camera`), relative to the
+  depth of the pixel; this is a port choice, because the raw depth buffer
+  value changes little far from the camera. `d3d_ao_capture` now also
+  runs when only SMAA is on. The occlusion pass keeps the camera of the
+  frame (`applied`), so SMAA can also use it with AO on. A frame without a
+  scene camera has the edge detection without predication. Diagonal
+  detection is not done: it needs the SMAA reference source.
+
+Verification: the changed runtime files compiled with `-Werror`. The
+built-in, post-processing Metal sources compiled with `xcrun metal` with
+no warnings. `tools/build_app.sh` completed with no warnings. Not
+verified (UNCONFIRMED): the game was not run. Not known: whether the game
+uses the stencil of the shadow maps, whether it draws to the back buffer
+with sRGB writes (that stops the game with a message in HDR with GT7),
+whether the depth buffer stays the same from the scene to the present,
+and how the MetalFX scaler in the perceptual mode handles values above 1.
+
+## 2026-11-12: SMAA diagonal detection
+
+With the approval of the user, `SMAA.hlsl`, `Scripts/AreaTex.py` and
+`LICENSE.txt` of github.com/iryoku/smaa were downloaded into the
+scratchpad of the session. They are not in the repository. The
+downloaded script was read but not run.
+
+- `rt_d3d9_post.m`: `smaa_weights` now does the diagonal pattern search of
+  the reference (`search_diag`, `diag_weights`), with point reads in place
+  of the bilinear reads, and 16 diagonal steps (the "ultra" value). A
+  pixel with a diagonal skips its horizontal and vertical runs, as in the
+  reference. The diagonal area texture (80 x 80, RG8) is calculated once
+  on the CPU by `diag_area_texture`, a port of `areadiag` of AreaTex.py
+  for the subsample offset of SMAA 1x: 30 x 30 samples for each pixel and
+  the 8-bit truncation of the script. The file has the SMAA license
+  notice.
+- `README.md`: the SMAA description and the license line.
+
+Verification: `rt_d3d9_post.m` compiled with `-Werror`; the
+post-processing Metal source compiled with `xcrun metal` with no
+warnings; `tools/build_app.sh` completed with no warnings. Not verified
+(UNCONFIRMED): the game was not run, and the area texture was not
+compared with the reference AreaTex.h data.
+
+## 2026-11-12: SMAA ultra preset, color edges and reference blending
+
+- `rt_d3d9_post.m`: the edge detection is now the color edge detection
+  of the SMAA reference (`SMAAColorEdgeDetectionPS`): the difference of
+  two pixels is the largest difference of their color channels. The
+  local contrast test compares with the pixel itself, as the reference
+  does. The threshold is 0.05 (the "ultra" preset); with depth
+  predication it is 0.1, or 0.06 at a depth edge. The luma functions are
+  removed because nothing uses them now.
+- `rt_d3d9_post.m`: the blend pass is now the method of
+  `SMAANeighborhoodBlendingPS`. A pixel blends along one axis (the axis
+  with the larger weight), with the two weights of that axis normalized.
+  Each weight mixes the pixel with its neighbor; the reference does this
+  with a bilinear read, which gives the same result. The old blend mixed
+  all four neighbors at the same time.
+- `README.md`: the SMAA description.
+
+Verification: `rt_d3d9_post.m` compiled with `-Werror`; the
+post-processing Metal source compiled with `xcrun metal` with no
+warnings; `tools/build_app.sh` completed with no warnings. Not verified
+(UNCONFIRMED): the game was not run.
+
+## 2026-11-12: SMAA T2x
+
+- `rt_enh.h`, `rt_enh.c`, `rt_menu.c`: the SMAA setting has the values
+  Off, 1x and T2x (`SettingMacSMAA` 0, 1 and 2).
+- `rt_d3d9_post.m`: the orthogonal areas now come from a texture (528 x
+  99, RG8). The functions `ortho_area1`, `ortho_smooth`, `ortho_z` and
+  `ortho_area` are a port of `area`, `smootharea` and `areaortho` of
+  AreaTex.py. `ortho_texture` calculates the table for the distances 0 to 32
+  and the three subsample offsets 0, -0.25 and 0.25. The diagonal area
+  texture now has the three diagonal offsets of the reference (80 x 240).
+  `smaa_weights` gets the subsample set of each search direction; SMAA 1x
+  uses set 0.
+- `rt_d3d9_post.m`: `d3d_post_t2x` runs the T2x passes once in each
+  frame: edges with depth predication, weights with the set of the frame,
+  the camera velocity of each pixel (from the depth, the inverse of the
+  view-projection of this frame and the view-projection of the last
+  frame), the blend with the velocity weight in alpha, and the resolve
+  into the back buffer. The resolve is `SMAAResolvePS` with reprojection
+  and the weight scale 30. It also clamps the last frame to the color
+  range of the 3 x 3 pixels of this frame; the reference does not do
+  this. The clamp is necessary because the game gives no motion for
+  moving objects.
+- `rt_d3d9_post.m`: `d3d_post_t2x_jitter` gives the jitter of the frame:
+  (0.25, 0.25) pixels for even frames and (-0.25, -0.25) for odd frames,
+  with y down (the reference values with y up). A frame has the jitter
+  only when the last frame had the resolve. `d3d_post_frame_end` records
+  this at the present. `d3d_post_process` does not do SMAA 1x for a frame
+  with the resolve.
+- `rt_d3d9_draw.m`: the bloom composite draw calls `d3d_post_t2x` after
+  the GT7 scene pass. The vertex shader offset (`vs_misc`) gets the
+  jitter for draws with the world-view-projection matrix, in a pass at
+  the back buffer size with scale 1 and a full viewport. `d3d_present`
+  calls `d3d_post_frame_end`.
+- `rt_d3d9_int.h`: the device field `t2x_frame` and the declarations of
+  the three functions.
+- `README.md`: the setting values and the T2x description.
+
+Verification: `rt_d3d9_post.m`, `rt_d3d9_draw.m`, `rt_d3d9_res.m`,
+`rt_d3d9_ao.m`, `rt_d3d9.m`, `rt_enh.c` and `rt_menu.c` compiled with
+`-Werror`; the post-processing Metal source compiled with `xcrun metal`
+with no warnings; `tools/build_app.sh` completed with no warnings. Not
+verified (UNCONFIRMED): the game was not run. The area textures were not
+compared with the reference AreaTex.h data. The camera velocity is
+correct only if the world-view-projection matrix of the depth capture
+does not include a camera-relative world offset. The jitter conditions
+were not checked against the draws of the game (scene passes at the back
+buffer size, HUD draws without the world-view-projection matrix).

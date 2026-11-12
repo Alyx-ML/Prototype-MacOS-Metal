@@ -298,20 +298,29 @@ typedef struct menu_row {
 } menu_row;
 
 static const char *const v_off_on[] = {"$OFF", "$ON"};
-static const char *const v_aniso[] = {"GAME", "16x"};
 static const char *const v_shadow[] = {"GAME", "2x", "4x"};
 static const char *const v_sharpen[] = {"$OFF", "$LOW", "$MED", "$HIGH"};
 static const char *const v_icons[] = {"GAME", "CONTROLLER"};
+static const char *const v_fov[] = {"GAME", "+5", "+10", "+15", "+20", "+25", "+30"};
+static const char *const v_pcss[] = {"$OFF", "$LOW", "$HIGH"};
+static const char *const v_tonemap[] = {"GAME", "GT7"};
+static const char *const v_bloom[] = {"GAME", "KAWASE"};
+static const char *const v_smaa[] = {"$OFF", "1x", "T2x"};
 
 #define ROW(t, l, id, v) {t, l, id, v, sizeof v / sizeof v[0]}
 
 static const menu_row video_rows[] = {
-    ROW("tglMacAnisotropic", "ANISOTROPIC FILTERING", RT_ENH_ANISOTROPY, v_aniso),
     ROW("tglMacHDR", "HDR", RT_ENH_HDR, v_off_on),
     ROW("tglMacShadowRes", "SHADOW RESOLUTION (RESTART)", RT_ENH_SHADOW_RES, v_shadow),
     ROW("tglMacMetalFX", "METALFX UPSCALING", RT_ENH_METALFX, v_off_on),
     ROW("tglMacSharpen", "SHARPENING (CAS)", RT_ENH_SHARPEN, v_sharpen),
-    ROW("tglMacSMAA", "SMAA ANTI-ALIASING", RT_ENH_SMAA, v_off_on),
+    ROW("tglMacSMAA", "SMAA ANTI-ALIASING", RT_ENH_SMAA, v_smaa),
+    ROW("tglMacFOV", "FIELD OF VIEW", RT_ENH_FOV, v_fov),
+    ROW("tglMacAO", "AMBIENT OCCLUSION (XEGTAO)", RT_ENH_AO, v_sharpen),
+    ROW("tglMacPCSS", "SOFT SHADOWS (PCSS)", RT_ENH_PCSS, v_pcss),
+    ROW("tglMacContact", "CONTACT SHADOWS", RT_ENH_CONTACT, v_off_on),
+    ROW("tglMacBloom", "BLOOM", RT_ENH_BLOOM, v_bloom),
+    ROW("tglMacToneMap", "TONE MAPPING", RT_ENH_TONEMAP, v_tonemap),
 };
 
 static const menu_row controller_rows[] = {

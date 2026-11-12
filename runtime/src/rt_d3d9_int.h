@@ -214,6 +214,21 @@ const d3d_format *d3d_format_find(uint32_t fmt);
     uint32_t lock_flags;
     uint64_t last_use;
     uint32_t scale;           /* Metal size = scale * D3D size (d3d_shadow_scale) */
+    /* A standalone color render target with scale > 1. No path can read it
+       (d3d_check_unscaled, and a standalone surface is not a texture), so
+       its texture is memoryless: passes do not load or store it. */
+    bool discard;
+    /* A depth-stencil surface with stencil and scale > 1 (a shadow map)
+       whose stencil no draw or clear quad has used yet. Its passes do not
+       load or store the stencil; stencil_value is the value of the last
+       full stencil clear (rt_d3d9_draw.m need_stencil). */
+    bool stencil_idle;
+    uint8_t stencil_value;
+    /* The back buffer with HDR and GT7 on (rt_d3d9_draw.m
+       backbuffer_format): tex is RGBA16Float, not the format of f. The
+       values are gamma-encoded as in the 8-bit format; the GT7 scene pass
+       writes values above 1 (the highlights up to the EDR headroom). */
+    bool hdr;
 }
 @end
 
@@ -254,7 +269,7 @@ typedef struct d3d_velem {
     uint32_t id;
     d3d_shader sh;
     id<MTLFunction> vs_func;
-    NSMutableDictionary<NSNumber *, id<MTLFunction>> *ps_funcs; /* key: vs id << 16 | depth compare mask */
+    NSMutableDictionary<NSNumber *, id<MTLFunction>> *ps_funcs; /* key: vs id << 19 | contact << 18 | pcss << 16 | depth compare mask */
 }
 @end
 
@@ -315,6 +330,12 @@ typedef struct d3d_stream {
     id<MTLTexture> gamma_tex;
     id<MTLRenderPipelineState> present_pso, present_pso_hdr; /* drawable BGRA8Unorm, RGBA16Float (HDR) */
     id post; /* the post-processing state (rt_d3d9_post.m) */
+    id ao;    /* the ambient occlusion state (rt_d3d9_ao.m) */
+    id sss;   /* the contact shadow state (rt_d3d9_sss.m) */
+    id bloom; /* the Kawase bloom state (rt_d3d9_bloom.m) */
+    uint32_t gt7_frame; /* present_count + 1 of the last GT7 scene pass, 0 = none */
+    uint32_t t2x_frame; /* present_count + 1 of the last SMAA T2x resolve, 0 = none */
+    id hdr_sdr;         /* 8-bit copy of the HDR back buffer (d3d_hdr_sdr_copy) */
     id<MTLSamplerState> present_linear, present_point;
     id<MTLLibrary> builtin_lib;
     uint32_t cursor_x, cursor_y;
@@ -579,6 +600,62 @@ id<MTLTexture> d3d_post_process(D3DDevice *d, id<MTLTexture> src, uint32_t out_w
 /* Sets the layer for the HDR setting and returns the EDR headroom of the
    display (1 when the display has none). */
 float d3d_post_hdr_begin(D3DDevice *d);
+/* The last EDR headroom that d3d_post_hdr_begin found (1 at the start). */
+float d3d_post_headroom(D3DDevice *d);
+/* SMAA T2x (RT_ENH_SMAA 2). d3d_post_t2x: after the bloom composite of the
+   scene into the back buffer (and the GT7 scene pass), the SMAA passes with
+   the subsample set of the frame and the temporal resolve with the last
+   frame into the back buffer, before the HUD; true if it ran (once in each
+   frame; it ends the current pass). d3d_post_t2x_jitter: the subpixel
+   offset (pixels, y down) of the scene draws of this frame; false when the
+   draws have no jitter. d3d_post_frame_end: called by d3d_present before
+   the frame counter increments. */
+bool d3d_post_t2x(D3DDevice *d);
+bool d3d_post_t2x_jitter(D3DDevice *d, float j[2]);
+void d3d_post_frame_end(D3DDevice *d);
+/* The back buffer in its D3D format for a path that reads it (StretchRect,
+   GetRenderTargetData): for an HDR back buffer (D3DSurface.hdr) an 8-bit
+   copy of the current contents (values above 1 become 1), else s's
+   texture. */
+id<MTLTexture> d3d_hdr_sdr_copy(D3DDevice *d, D3DSurface *s, id<MTLTexture> t);
+/* XeGTAO ambient occlusion (rt_d3d9_ao.m), for the Mac enhancement setting
+   RT_ENH_AO. do_draw calls d3d_ao_capture before each draw with a vertex
+   shader that has the matrices p3dWorldViewProjectionMatrix and
+   p3dWorldMatrix: a draw of the scene into the full-size depth buffer
+   gives the camera projection of the frame. do_draw calls d3d_ao_apply
+   before the draw of the composite pixel shader (ct_scene_sampler): it
+   ends the render pass, calculates the occlusion from the depth buffer and
+   multiplies the scene texture by it. */
+void d3d_ao_capture(D3DDevice *d, D3DShader *vs);
+void d3d_ao_apply(D3DDevice *d, D3DShader *ps);
+/* The camera of this frame from d3d_ao_capture: the view-projection rows
+   (scaled so that |row3.xyz| = 1), the projection terms P22 and P23 (the
+   view depth of a depth value z is P23 / (z - P22)) and the full-size depth
+   texture. Returns false when no scene draw of this frame gave a camera. */
+bool d3d_ao_camera(D3DDevice *d, float vp[4][4], float p22_p23[2], id<MTLTexture> __strong *depth);
+/* Bend Studio contact shadows (rt_d3d9_sss.m), for RT_ENH_CONTACT. do_draw
+   calls d3d_sss_draw before each draw whose pixel shader reads the shadow
+   map (a depth comparison sampler). The first such draw of a frame into a
+   full-size target calculates the contact shadows from the depth buffer.
+   Returns the contact shadow texture when the draw can use it, else nil. */
+id<MTLTexture> d3d_sss_draw(D3DDevice *d, D3DShader *vs, D3DShader *ps);
+/* Dual Kawase bloom (rt_d3d9_bloom.m), for RT_ENH_BLOOM. d3d_bloom_draw
+   is called before each draw. It returns false for a draw of the game's
+   bloom blur shader that is replaced (the draw is skipped). At the bright
+   pass it keeps the bright-pass render target; at the composite draw it
+   blurs that target into the BloomedScene texture of the composite. */
+bool d3d_bloom_draw(D3DDevice *d, D3DShader *ps);
+/* GT7 tone mapping constants (rt_d3d9_post.m), struct GT7P of the shaders
+   of rt_d3d9_draw.m: for SDR output (hdr false) or HDR output (hdr true,
+   headroom = EDR headroom of the display). Returns false when
+   RT_ENH_TONEMAP is off. The caller sets srgb (1 when the render target is
+   an sRGB format) and hdr (1 when gt7_scene_fs writes the HDR back
+   buffer: the result is not clipped at 1). */
+typedef struct d3d_gt7_params {
+    float peak, peak_ucs, out_scale, ka, kb, kc, expand;
+    uint32_t srgb, hdr;
+} d3d_gt7_params;
+bool d3d_post_gt7(d3d_gt7_params *g, bool hdr, float headroom);
 /* Resource classes (rt_d3d9_res.m). */
 extern const rt_com_class d3d_texture_class, d3d_cube_class, d3d_volume_class, d3d_surface_class, d3d_vb_class, d3d_ib_class,
     d3d_decl_class, d3d_vs_class, d3d_ps_class, d3d_query_class;

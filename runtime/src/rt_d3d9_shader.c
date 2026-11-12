@@ -159,6 +159,104 @@ static bool find_io(const d3dsh_io *arr, int n, uint32_t usage, uint32_t index)
     return false;
 }
 
+/* Read the constant table of a "CTAB" comment: b points to the table (after
+   the fourcc), n is its size in bytes. The D3DX layout: a header with the
+   constant count at byte 12 and the offset of the constant entries at byte
+   16; entries of 20 bytes (name offset, register set u16, register index
+   u16, register count u16, reserved u16, type offset, default offset); a
+   type starts with its class u16. All offsets are from the start of the
+   table. Entries with an offset outside the table are ignored. */
+static uint32_t ct_u32(const uint8_t *b) { uint32_t v; memcpy(&v, b, 4); return v; }
+static uint32_t ct_u16(const uint8_t *b) { uint16_t v; memcpy(&v, b, 2); return v; }
+
+static void ctab_read(d3d_shader *sh, const uint8_t *b, uint32_t n)
+{
+    uint32_t cnt, info, i;
+    int fb = -1, bloom_s = -1;
+    bool bloomed = false, strength = false, cutoff = false, falloff = false, blur_o = false, blur_w = false;
+    if (n < 20u) return;
+    cnt = ct_u32(b + 12);
+    info = ct_u32(b + 16);
+    if (info > n || cnt > (n - info) / 20u) return;
+    for (i = 0; i < cnt; i++)
+    {
+        const uint8_t *e = b + info + 20u * i;
+        uint32_t name = ct_u32(e), set = ct_u16(e + 4), reg = ct_u16(e + 6), count = ct_u16(e + 8), type = ct_u32(e + 12);
+        uint32_t cls = 0;
+        const char *nm;
+        if (name >= n || memchr(b + name, 0, n - name) == NULL) continue;
+        nm = (const char *)(b + name);
+        if (type <= n - 2u) cls = ct_u16(b + type);
+        if (set == 2u /* float */ && count == 4u && reg + 4u <= D3DSH_VS_CONST_F &&
+            (cls == D3DSH_CLASS_MATRIX_ROWS || cls == D3DSH_CLASS_MATRIX_COLUMNS))
+        {
+            if (strcmp(nm, "p3dWorldViewProjectionMatrix") == 0)
+            {
+                sh->ct_wvp = (int16_t)reg;
+                sh->ct_wvp_class = (uint8_t)cls;
+            }
+            else if (strcmp(nm, "p3dWorldMatrix") == 0)
+            {
+                sh->ct_world = (int16_t)reg;
+                sh->ct_world_class = (uint8_t)cls;
+            }
+            else if (strcmp(nm, "p3dShadowMapMatrix") == 0)
+            {
+                sh->ct_shadow = (int16_t)reg;
+                sh->ct_shadow_class = (uint8_t)cls;
+            }
+        }
+        else if (set == 3u /* sampler */ && strcmp(nm, "p3dFrameBufferCurrent") == 0 && reg < D3DSH_MAX_SAMPLERS)
+            fb = (int)reg;
+        else if (set == 3u && strcmp(nm, "BloomedScene") == 0 && reg < D3DSH_MAX_SAMPLERS)
+        {
+            bloomed = true;
+            bloom_s = (int)reg;
+        }
+        else if (set == 2u && strcmp(nm, "BloomStrength") == 0)
+            strength = true;
+        else if (set == 2u && strcmp(nm, "Cutoff") == 0)
+            cutoff = true;
+        else if (set == 2u && strcmp(nm, "FalloffPower") == 0)
+            falloff = true;
+        else if (set == 2u && strcmp(nm, "BlurOffset1") == 0)
+            blur_o = true;
+        else if (set == 2u && strcmp(nm, "BlurWeight1") == 0)
+            blur_w = true;
+    }
+    if (!sh->is_ps || fb < 0) return;
+    if (bloomed && strength)
+    {
+        sh->ct_scene_sampler = (int8_t)fb;
+        sh->ct_bloom_sampler = (int8_t)bloom_s;
+    }
+    else if (cutoff && falloff)
+        sh->ct_role = D3DSH_ROLE_BLOOM_BRIGHT;
+    else if (blur_o && blur_w)
+        sh->ct_role = D3DSH_ROLE_BLOOM_BLUR;
+}
+
+/* Find the constant table in the comments of a parsed token stream. */
+static void ctab_scan(d3d_shader *sh)
+{
+    uint32_t pos = 1;
+    while (pos < sh->ntokens)
+    {
+        uint32_t t = sh->tokens[pos], op = t & 0xFFFFu, len;
+        if (op == OP_END) return;
+        if (op == OP_COMMENT)
+        {
+            len = (t >> 16) & 0x7FFFu;
+            if (len > sh->ntokens - pos - 1u) return;
+            if (len >= 2u && sh->tokens[pos + 1u] == 0x42415443u /* "CTAB" */)
+                ctab_read(sh, (const uint8_t *)(sh->tokens + pos + 2u), (len - 1u) * 4u);
+        }
+        else
+            len = (t >> 24) & 0xFu;
+        pos += 1u + len;
+    }
+}
+
 bool d3d_shader_parse(d3d_shader *sh, const uint32_t *tokens, uint32_t max_tokens, char *err, size_t errn)
 {
     uint32_t pos = 1, ntk, major, minor;
@@ -204,6 +302,12 @@ bool d3d_shader_parse(d3d_shader *sh, const uint32_t *tokens, uint32_t max_token
     }
     memcpy(sh->tokens, tokens, sizeof(uint32_t) * ntk);
     sh->ntokens = ntk;
+    sh->ct_wvp = -1;
+    sh->ct_world = -1;
+    sh->ct_shadow = -1;
+    sh->ct_scene_sampler = -1;
+    sh->ct_bloom_sampler = -1;
+    ctab_scan(sh);
 
     pos = 1;
     while (next_inst(sh->tokens, ntk, &pos, &in, &end, err, errn))
@@ -398,6 +502,8 @@ typedef struct gen {
     bool failed;
     int indent, loop_depth, call_depth;
     uint16_t depth_compare;
+    uint32_t pcss; /* PCSS level for the comparison samplers (0 = off) */
+    bool contact;  /* multiply comparison results by the contact shadow */
     uint32_t labels[MAX_LABELS]; /* token position of each label instruction, 0 = none */
 } gen;
 
@@ -730,7 +836,12 @@ static void tex_sample(gen *g, const inst *in, uint32_t dtok, uint32_t ptok, con
             return;
         }
         ex_set(g, &r, proj ? "((%s).z / (%s).w)" : "(%s).z", coord, coord);
-        ex_set(g, &v, "float4(%st%u.sample_compare(%ss%u, %s, %s))%s", tp, s, tp, s, c.s, r.s, swz);
+        if (g->pcss != 0)
+            ex_set(g, &v, "float4(d3d_pcss(%st%u, %ss%u, %s, %s)%s)%s", tp, s, tp, s, c.s, r.s,
+                   g->contact ? " * d3d_csv" : "", swz);
+        else
+            ex_set(g, &v, "float4(%st%u.sample_compare(%ss%u, %s, %s)%s)%s", tp, s, tp, s, c.s, r.s,
+                   g->contact ? " * d3d_csv" : "", swz);
     }
     else if (lod)
         ex_set(g, &v, "%st%u.sample(%ss%u, %s, level((%s).w))%s", tp, s, tp, s, c.s, coord, swz);
@@ -1324,8 +1435,69 @@ bool d3d_shader_msl_vs(const d3d_shader *vs, d3dsh_text *out, char *err, size_t 
     return finish(&g, out);
 }
 
+/* Percentage-closer soft shadows (PCSS, the method of NVIDIA, Randima
+   Fernando 2005) for a comparison sample of the shadow map:
+     1. Blocker search: gathers of the depth (four texels in each fetch)
+        in a disk of the largest penumbra radius. The mean depth of the
+        texels that are nearer to the light than the receiver is the
+        blocker depth.
+     2. Penumbra estimate: the radius is proportional to the distance
+        from the receiver to the blocker in the depth range of the map,
+        between one texel and the largest radius.
+     3. Filtering: comparison samples (with the hardware 2x2 filter of the
+        game's sampler) in a disk of that radius.
+   The game's shadow map is an atlas of four cascades in a 2x2 grid of the
+   2048x2048 texture (from the four p3dShadowMapChildBox constants; the
+   grid layout is UNCONFIRMED). The samples are clamped to the grid cell of
+   the center sample, so a filter does not read a different cascade.
+   PCSS_K (penumbra radius in texture coordinates for each unit of depth
+   difference) and the largest radius are tuned values, not values from
+   the game (UNCONFIRMED visual result). With no blocker the result is the
+   single comparison sample of the game. */
+static void emit_pcss(gen *g)
+{
+    static const char *const disk =
+        "constant float2 d3d_pcss_disk[16] = {\n"
+        "    float2(-0.9420, -0.3991), float2(0.9456, -0.7689), float2(-0.0942, -0.9294), float2(0.3450, 0.2939),\n"
+        "    float2(-0.9159, 0.4577), float2(-0.8154, -0.8791), float2(-0.3828, 0.2768), float2(0.9748, 0.7565),\n"
+        "    float2(0.4432, -0.9751), float2(0.5374, -0.4737), float2(-0.2650, -0.4189), float2(0.7920, 0.1909),\n"
+        "    float2(-0.2419, 0.9971), float2(-0.8141, 0.9144), float2(0.1998, 0.7864), float2(0.1438, -0.1410)\n"
+        "};\n";
+    /* Level 1: 4 blocker gathers (16 texels) and 8 filter samples, radius
+       up to 4 texels of a 2048 map. Level 2: 8 gathers (32 texels) and 16
+       filter samples, up to 8 texels. A gather costs one fetch, so the
+       search reads twice the texels of point samples with half the
+       fetches. */
+    uint32_t taps = g->pcss >= 2 ? 16u : 8u, gathers = taps / 2u;
+    float maxr = (g->pcss >= 2 ? 8.0f : 4.0f) / 2048.0f;
+    emit(g, "%s", disk);
+    emit(g, "static inline float d3d_pcss(depth2d<float> t, sampler s, float2 uv, float z)\n{\n"
+            "    constexpr sampler pt(filter::nearest, address::clamp_to_edge);\n"
+            "    const float PCSS_K = 0.25, maxr = %.9g;\n"
+            "    float2 ts = 1.0 / float2(t.get_width(), t.get_height());\n"
+            "    float2 lo = floor(saturate(uv) * 2.0) * 0.5;\n"
+            "    float2 hi = min(lo + 0.5, float2(1.0)) - ts * 0.5;\n"
+            "    lo += ts * 0.5;\n"
+            /* A gather reads the 2x2 texels around its point: one more
+               half texel keeps them in the cell. */
+            "    float2 glo = lo + ts * 0.5, ghi = hi - ts * 0.5;\n"
+            "    float bsum = 0.0, bn = 0.0;\n"
+            "    for (int i = 0; i < %u; i++) {\n"
+            "        float4 d = t.gather(pt, clamp(uv + d3d_pcss_disk[i] * maxr, glo, ghi));\n"
+            "        float4 b = select(float4(0.0), float4(1.0), d < z);\n"
+            "        bsum += dot(d, b); bn += b.x + b.y + b.z + b.w;\n"
+            "    }\n"
+            "    if (bn == 0.0) return t.sample_compare(s, uv, z);\n"
+            "    float pen = clamp((z - bsum / bn) * PCSS_K, ts.x, maxr);\n"
+            "    float sum = 0.0;\n"
+            "    for (int i = 0; i < %u; i++) sum += t.sample_compare(s, clamp(uv + d3d_pcss_disk[i] * pen, lo, hi), z);\n"
+            "    return sum * %.9g;\n"
+            "}\n\n",
+         (double)maxr, gathers, taps, 1.0 / (double)taps);
+}
+
 bool d3d_shader_msl_ps(const d3d_shader *ps, const d3dsh_io *vs_outputs, int nvs, uint16_t depth_compare,
-                       d3dsh_text *out, char *err, size_t errn)
+                       uint32_t pcss, bool contact, d3dsh_text *out, char *err, size_t errn)
 {
     gen g;
     int k, nmembers = 0;
@@ -1337,7 +1509,10 @@ bool d3d_shader_msl_ps(const d3d_shader *ps, const d3dsh_io *vs_outputs, int nvs
     }
     if (!gen_init(&g, ps, out, err, errn)) return finish(&g, out);
     g.depth_compare = depth_compare;
-    need_pos = ps->uses_vpos || ps->writes_depth;
+    g.pcss = depth_compare != 0 ? pcss : 0u;
+    if (g.pcss != 0) emit_pcss(&g);
+    g.contact = depth_compare != 0 && contact;
+    need_pos = ps->uses_vpos || ps->writes_depth || g.contact;
 
     for (k = 0; k < ps->ninputs; k++)
     {
@@ -1364,8 +1539,12 @@ bool d3d_shader_msl_ps(const d3d_shader *ps, const d3dsh_io *vs_outputs, int nvs
     emit(&g, "\n    constant float4 *c [[buffer(16)]], constant int4 *ci [[buffer(17)]], constant uint *cb [[buffer(18)]],\n"
              "    constant float4 &ps_misc [[buffer(19)]]");
     texture_params(&g, ps, depth_compare);
+    if (g.contact)
+        emit(&g, ",\n    texture2d<float, access::read> d3d_cs [[texture(%u)]]", D3DSH_CONTACT_TEXTURE);
     emit(&g, ")\n{\n");
     g.indent = 1;
+    /* The contact shadow of this pixel (1 = lit). */
+    if (g.contact) emit(&g, "float d3d_csv = d3d_cs.read(uint2(fpos.xy)).r;\n");
     if (ps->uses_vpos) emit(&g, "float4 vpos = float4(fpos.xy - 0.5, fpos.z, fpos.w);\n");
     if (ps->uses_vface) emit(&g, "float vface = ffront ? 1.0 : -1.0;\n");
     for (k = 0; k < ps->ninputs; k++)

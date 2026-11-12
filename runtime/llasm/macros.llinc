@@ -6,3 +6,5 @@ funcv rt_enh_db_get_int $
 funcv rt_enh_db_set_int $
 funcv rt_enh_db_restore $
 funcv rt_enh_glyph_set $
+funcv rt_enh_fov_add $
+funcv rt_enh_fov_force $

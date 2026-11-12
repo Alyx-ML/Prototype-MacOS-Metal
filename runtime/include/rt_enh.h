@@ -15,15 +15,20 @@
 #include <stdbool.h>
 
 typedef enum rt_enh_id {
-    RT_ENH_ANISOTROPY,     /* 0 game setting, 1 16x */
     RT_ENH_HDR,            /* 0 off, 1 on (EDR output) */
     RT_ENH_SHADOW_RES,     /* 0 game size, 1 2x, 2 4x */
     RT_ENH_METALFX,        /* 0 off, 1 MetalFX spatial upscale to the display size */
     RT_ENH_SHARPEN,        /* 0 off, 1 low, 2 medium, 3 high */
-    RT_ENH_SMAA,           /* 0 off, 1 on */
+    RT_ENH_SMAA,           /* 0 off, 1 SMAA 1x, 2 SMAA T2x (rt_d3d9_post.m) */
     RT_ENH_BUTTON_ICONS,   /* 0 game icons, 1 icons of the connected controller */
     RT_ENH_TRIGGERS,       /* 0 off, 1 DualSense adaptive triggers */
     RT_ENH_RUMBLE,         /* 0 game rumble, 1 enhanced rumble */
+    RT_ENH_FOV,            /* gameplay camera field of view: 0 game, n = game + 5n degrees (n 1 to 6) */
+    RT_ENH_AO,             /* 0 off, 1 low, 2 medium, 3 high (XeGTAO ambient occlusion) */
+    RT_ENH_PCSS,           /* 0 off, 1 low, 2 high (PCSS soft shadows) */
+    RT_ENH_TONEMAP,        /* 0 game, 1 GT7 tone mapping (Polyphony Digital) */
+    RT_ENH_BLOOM,          /* 0 game blur, 1 dual Kawase blur of the game's bloom */
+    RT_ENH_CONTACT,        /* 0 off, 1 on (Bend Studio screen-space contact shadows) */
     RT_ENH_COUNT
 } rt_enh_id;
 

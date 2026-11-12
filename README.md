@@ -163,30 +163,76 @@ reads `art.rcf`. The file on disk does not change.
 
 | Screen | Row | Values | Default |
 | --- | --- | --- | --- |
-| Video | Anisotropic Filtering | Game, 16x | 16x |
 | Video | HDR | Off, On | Off |
 | Video | Shadow Resolution (restart) | Game, 2x, 4x | Game |
 | Video | MetalFX Upscaling | Off, On | Off |
 | Video | Sharpening (CAS) | Off, Low, Medium, High | Off |
-| Video | SMAA Anti-Aliasing | Off, On | Off |
+| Video | SMAA Anti-Aliasing | Off, 1x, T2x | Off |
+| Video | Field of View | Game, +5 to +30 (degrees, steps of 5) | Game |
+| Video | Ambient Occlusion (XeGTAO) | Off, Low, Medium, High | Off |
+| Video | Soft Shadows (PCSS) | Off, Low, High | Off |
+| Video | Contact Shadows | Off, On | Off |
+| Video | Bloom | Game, Kawase | Game |
+| Video | Tone Mapping | Game, GT7 | Game |
 | Controller | Button Icons | Game, Controller | Controller |
 | Controller | Adaptive Triggers (DualSense) | Off, On | On |
 | Controller | Enhanced Rumble | Off, On | On |
 
-- Anisotropic Filtering sets 16x filtering on each texture that has mipmaps
-  and linear filtering.
+- Anisotropic filtering is always 16x (no menu row). It applies to each
+  texture that has mipmaps and linear filtering.
 - HDR shows the game on an EDR display (extended dynamic range). Bright
   areas use the headroom of the display. A display without headroom shows
   the image as before.
 - Shadow Resolution makes the shadow maps 2 or 4 times larger in each
-  direction. The new value applies at the next start of the game.
+  direction. The new value applies at the next start of the game. The
+  shadow pass does not save its unused color target or the stencil of the
+  shadow map, so the larger maps use less memory bandwidth.
 - MetalFX Upscaling scales the image to the size of the window with the
   MetalFX spatial scaler. It has an effect only when the game resolution is
   smaller than the window.
 - Sharpening is contrast-adaptive sharpening (CAS).
-- SMAA is the SMAA 1x method with the "low" quality steps: edge detection
-  on luma, orthogonal search of 32 pixels and blending. It has no diagonal
-  or corner detection.
+- SMAA is the SMAA 1x method with the settings of the "ultra" preset:
+  edge detection on color with depth predication, diagonal detection,
+  orthogonal search of 32 pixels and diagonal search of 16 pixels, corner
+  detection and the blending of the SMAA reference. Depth predication finds more edges where the
+  depth changes and fewer edges in textures. Diagonal detection makes
+  sloped edges smoother.
+- SMAA T2x adds a temporal step to SMAA 1x. The scene moves by a quarter
+  pixel in alternate frames. After the scene and before the HUD, the
+  SMAA passes use the area values for the offset of the frame. Then the
+  image is mixed with the last frame at the position that the camera
+  motion gives. The mix decreases where the motion changes, and the last
+  frame is limited to the colors of the 3 x 3 pixels around each pixel,
+  so moving objects have less ghosting. A frame without a 3D scene (for
+  example a menu) gets SMAA 1x.
+- Field of View adds degrees to the field of view of the game camera.
+- Ambient Occlusion is the XeGTAO method of Intel. It makes corners and
+  contact areas darker. Low, Medium and High use 1, 2 and 3 directions for
+  each pixel. The multi-bounce approximation of GTAO keeps light surfaces
+  from going grey in corners.
+- Soft Shadows is percentage-closer soft shadows (PCSS). A shadow edge
+  gets softer as the distance from the object that casts the shadow
+  increases.
+- Contact Shadows is the screen-space shadow method of Bend Studio. It
+  adds short sun shadows from the depth buffer where the shadow map has
+  too little detail, for example below small objects and at the feet of
+  characters. The shadows fade out between 40 and 80 meters from the
+  camera.
+- Bloom Kawase replaces the blur of the game's bloom with a dual Kawase
+  blur (five half-size passes down and five passes up). The first pass
+  uses the 13-tap filter with the Karis average, so small bright points
+  do not flicker. The up passes add the levels together, so the glow
+  falls off gradually around a light. The game's bloom strength stays the
+  same.
+- Tone Mapping GT7 applies the tone mapping of Gran Turismo 7 to the scene
+  before the HUD: a soft shoulder for bright areas and colors that keep
+  their hue near white. The HUD and the menus keep their colors. The
+  highlights are expanded before the curve, so white stays at 98 percent.
+  With HDR on, the tone mapping applies after the expansion to the EDR
+  headroom, with the peak of the curve at the headroom. The back buffer is
+  then a 16-bit float image, so the scene keeps its highlights and the HUD
+  stays at SDR white. Menus without the 3D scene get the expansion and the
+  curve at the end of the frame.
 - Button Icons shows the PlayStation or the Xbox button icons for the
   controller that has the first player slot.
 - Adaptive Triggers gives light resistance on L2 and R2 of a DualSense
@@ -211,6 +257,18 @@ The game writes its settings, saved games and registry values into
 - The code of this port (`runtime/`, `tools/`, `tests/`): MIT license (see
   `LICENSE`).
 - The SR recompiler: MIT license (see `third_party/SR/README.md`).
+- `runtime/src/rt_d3d9_ao.m` is a port of XeGTAO, Copyright (C) 2016-2021
+  Intel Corporation, MIT license. The license text is in that file.
+- `runtime/src/rt_d3d9_sss.m` is a port of the screen-space shadows of Bend
+  Studio, Copyright 2023 Sony Interactive Entertainment, Apache License
+  2.0. That file has the license notice and a list of the changes.
+- The GT7 tone mapping in `runtime/src/rt_d3d9_draw.m` (built-in shader
+  library) is a port of the sample code of Polyphony Digital, Copyright (c) 2025
+  Polyphony Digital Inc., MIT license. The license text is in that file.
+- The SMAA diagonal detection in `runtime/src/rt_d3d9_post.m` is a port of
+  the SMAA reference implementation (SMAA.hlsl and AreaTex.py), Copyright
+  (C) 2013 Jorge Jimenez, Jose I. Echevarria, Belen Masia, Fernando Navarro
+  and Diego Gutierrez, MIT license. The license text is in that file.
 - The release package includes LLVM, lld, Z3, zstd and an LGPL build of
   FFmpeg. `tools/package_release.sh` copies their license files into
   `Contents/Resources/Licenses`.

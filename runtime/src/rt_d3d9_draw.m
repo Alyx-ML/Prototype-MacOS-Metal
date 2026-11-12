@@ -69,10 +69,107 @@ static const char builtin_src[] =
     /* use_lut: apply the gamma ramp of SetGammaRamp. hdr: the drawable is
        extended linear sRGB (Mac enhancement HDR); the highlights are expanded
        up to the EDR headroom of the display, and SDR white stays at 1.
-       src_linear: the source texture is an sRGB format (samples are linear). */
-    "struct PresentParams { uint use_lut; uint hdr; float headroom; uint src_linear; };\n"
+       src_linear: the source texture is an sRGB format (samples are linear).
+       The two curves also apply to values above 1 (the HDR back buffer). */
     "static float3 to_linear(float3 c) { return select(pow((c + 0.055) / 1.055, 2.4), c / 12.92, c <= 0.04045); }\n"
     "static float3 to_srgb(float3 c) { return select(1.055 * pow(c, 1.0 / 2.4) - 0.055, c * 12.92, c <= 0.0031308); }\n"
+    /* GT7 tone mapping (Mac enhancement RT_ENH_TONEMAP). The method is the
+       tone mapping of Gran Turismo 7 from the sample code of Polyphony
+       Digital, which is available under this license:
+         MIT License. Copyright (c) 2025 Polyphony Digital Inc.
+         Permission is hereby granted, free of charge, to any person
+         obtaining a copy of this software and associated documentation
+         files (the "Software"), to deal in the Software without
+         restriction, including without limitation the rights to use, copy,
+         modify, merge, publish, distribute, sublicense, and/or sell copies
+         of the Software, and to permit persons to whom the Software is
+         furnished to do so, subject to the following conditions: The above
+         copyright notice and this permission notice shall be included in
+         all copies or substantial portions of the Software. THE SOFTWARE IS
+         PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+         INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+         FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+         SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+         DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT
+         OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+         SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+       This is a Metal version of the method. Units: 1.0 = 100 nits, Rec.2020
+       primaries. Each channel goes through the GT7 curve (toe, linear part,
+       exponential shoulder to the peak); the result in the ICtCp space takes
+       the intensity of the curve and the chroma of the input (faded out near
+       the peak), and the two results are blended 40:60.
+       gt7_scene_fs applies it in place to the render target of the game's
+       bloom composite (the complete scene, before the HUD) with the
+       framebuffer fetch of Apple GPUs. Before the curve, the highlights are
+       expanded (factor p.expand at white, by luminance^4). SDR: the
+       expansion makes the game's white come out at 0.98 and not at the
+       shoulder value 0.84. HDR (p.hdr, the 16-bit float back buffer): the
+       expansion is the EDR expansion to the headroom, and the result is
+       not clipped at 1. GT7P agrees with d3d_gt7_params (rt_d3d9_int.h). */
+    "struct GT7P { float peak, peak_ucs, out_scale, ka, kb, kc, expand; uint srgb, hdr; };\n"
+    /* gt7: apply the EDR expansion and GT7 in HDR mode (a frame without
+       the scene pass). scene: the scene pass wrote the HDR back buffer;
+       the present shader only decodes it, so the HUD stays at SDR white. */
+    "struct PresentParams { uint use_lut; uint hdr; float headroom; uint src_linear; uint gt7; uint scene; GT7P g; };\n"
+    "static float gt7_curve(float x, constant GT7P &p)\n"
+    "{\n"
+    "    const float mid = 0.538, lin = 0.444, toe = 1.280;\n"
+    "    if (x < 0.0) return 0.0;\n"
+    "    if (x < lin * p.peak) {\n"
+    "        float w = smoothstep(0.0, mid, x);\n"
+    "        return (1.0 - w) * mid * pow(x / mid, toe) + w * x;\n"
+    "    }\n"
+    "    return p.ka + p.kb * exp(x * p.kc);\n"
+    "}\n"
+    "static float3 pq_inv(float3 n)\n"
+    "{\n"
+    "    const float m1 = 0.1593017578125, m2 = 78.84375, c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;\n"
+    "    float3 y = pow(max(n / 10000.0, 0.0), m1);\n"
+    "    return pow((c1 + c2 * y) / (1.0 + c3 * y), m2);\n"
+    "}\n"
+    "static float3 pq(float3 e)\n"
+    "{\n"
+    "    const float m1 = 0.1593017578125, m2 = 78.84375, c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;\n"
+    "    float3 ep = pow(max(e, 0.0), 1.0 / m2);\n"
+    "    return pow(max(ep - c1, 0.0) / (c2 - c3 * ep), 1.0 / m1) * 10000.0;\n"
+    "}\n"
+    /* ITU-R BT.2100 and the exact inverses (column-major: each float3 is a
+       column). */
+    "constant float3x3 rgb_lms = float3x3(float3(1688.0, 683.0, 99.0), float3(2146.0, 2951.0, 309.0),\n"
+    "    float3(262.0, 462.0, 3688.0)) * (1.0 / 4096.0);\n"
+    "constant float3x3 lms_ictcp = float3x3(float3(2048.0, 6610.0, 17933.0), float3(2048.0, -13613.0, -17390.0),\n"
+    "    float3(0.0, 7003.0, -543.0)) * (1.0 / 4096.0);\n"
+    "constant float3x3 lms_rgb = float3x3(float3(3.436606694, -0.791329556, -0.025949900),\n"
+    "    float3(-2.506452119, 1.983600452, -0.098913715), float3(0.069845424, -0.192270896, 1.124863614));\n"
+    "constant float3x3 ictcp_lms = float3x3(float3(1.0, 1.0, 1.0), float3(0.008609037, -0.008609037, 0.560031336),\n"
+    "    float3(0.111029625, -0.111029625, -0.320627175));\n"
+    "static float3 to_ictcp(float3 rgb) { return lms_ictcp * pq_inv(rgb_lms * (rgb * 100.0)); }\n"
+    "static float3 from_ictcp(float3 i) { return lms_rgb * pq(ictcp_lms * i) / 100.0; }\n"
+    "static float3 gt7(float3 rgb, constant GT7P &p)\n"
+    "{\n"
+    "    const float3x3 to2020 = float3x3(float3(0.627404, 0.069097, 0.016391), float3(0.329283, 0.919540, 0.088013),\n"
+    "        float3(0.043313, 0.011362, 0.895595));\n"
+    "    const float3x3 to709 = float3x3(float3(1.660491, -0.124550, -0.018151), float3(-0.587641, 1.132900, -0.100579),\n"
+    "        float3(-0.072850, -0.008349, 1.118730));\n"
+    "    float3 c = to2020 * max(rgb, 0.0);\n"
+    "    float3 u = to_ictcp(c);\n"
+    "    float3 sk = float3(gt7_curve(c.r, p), gt7_curve(c.g, p), gt7_curve(c.b, p));\n"
+    "    float3 su = to_ictcp(sk);\n"
+    "    float cs = 1.0 - smoothstep(0.98, 1.16, u.x / p.peak_ucs);\n"
+    "    float3 sc = from_ictcp(float3(su.x, u.y * cs, u.z * cs));\n"
+    "    float3 o = min(mix(sk, sc, 0.6), float3(p.peak));\n"
+    "    return to709 * o;\n"
+    "}\n"
+    "fragment float4 gt7_scene_fs(QV in [[stage_in]], float4 dst [[color(0)]], constant GT7P &p [[buffer(0)]])\n"
+    "{\n"
+    "    float3 l = p.srgb != 0u ? saturate(dst.rgb) : to_linear(saturate(dst.rgb));\n"
+    "    float y = dot(l, float3(0.2126, 0.7152, 0.0722));\n"
+    "    float y2 = y * y;\n"
+    "    l *= 1.0 + (p.expand - 1.0) * y2 * y2;\n"
+    "    l = gt7(l / p.out_scale, p) * p.out_scale;\n"
+    "    l = p.hdr != 0u ? max(l, 0.0) : saturate(l);\n"
+    "    return float4(p.srgb != 0u ? l : to_srgb(l), dst.a);\n"
+    "}\n"
     "fragment float4 present_fs(QV in [[stage_in]], texture2d<float> src [[texture(0)]],\n"
     "    texture2d<float> lut [[texture(1)]], sampler s [[sampler(0)]], constant PresentParams &pp [[buffer(0)]])\n"
     "{\n"
@@ -80,16 +177,20 @@ static const char builtin_src[] =
     "    if (pp.src_linear != 0u) c.rgb = to_srgb(saturate(c.rgb));\n"
     "    if (pp.use_lut != 0u) {\n"
     "        constexpr sampler ls(filter::linear, address::clamp_to_edge);\n"
+    "        float3 e = max(c.rgb - 1.0, 0.0);\n"
     "        float3 t = saturate(c.rgb) * (255.0 / 256.0) + (0.5 / 256.0);\n"
     "        c.r = lut.sample(ls, float2(t.r, 0.5)).r;\n"
     "        c.g = lut.sample(ls, float2(t.g, 0.5)).g;\n"
     "        c.b = lut.sample(ls, float2(t.b, 0.5)).b;\n"
+    "        c.rgb += e;\n"
     "    }\n"
     "    if (pp.hdr != 0u) {\n"
+    "        if (pp.scene != 0u) return float4(to_linear(max(c.rgb, 0.0)), 1.0);\n"
     "        float3 l = to_linear(saturate(c.rgb));\n"
     "        float y = dot(l, float3(0.2126, 0.7152, 0.0722));\n"
     "        float y2 = y * y;\n"
     "        l *= 1.0 + (max(pp.headroom, 1.0) - 1.0) * y2 * y2;\n"
+    "        if (pp.gt7 != 0u) l = max(gt7(l / pp.g.out_scale, pp.g) * pp.g.out_scale, 0.0);\n"
     "        return float4(l, 1.0);\n"
     "    }\n"
     "    return float4(c.rgb, 1.0);\n"
@@ -240,7 +341,12 @@ static id<MTLTexture> attach_texture(D3DSurface *s, bool srgb, NSUInteger *slice
 {
     id<MTLTexture> t = d3d_surface_texture(s, slice, level);
     if (t == nil) rt_fatal("D3D9: a system-memory surface is bound as a render target");
-    if (srgb && s->f->pf_srgb != MTLPixelFormatInvalid)
+    /* A memoryless surface has no views; its contents are never read, so
+       the sRGB encoding does not change a result. */
+    if (srgb && s->hdr)
+        rt_fatal("D3D9: the game draws to the back buffer with sRGB writes; the 16-bit float back buffer of HDR with "
+                 "GT7 tone mapping does not support them. Set \"Tone Mapping\" or \"HDR\" to off in the Video options");
+    if (srgb && !s->discard && s->f->pf_srgb != MTLPixelFormatInvalid)
     {
         __strong id<MTLTexture> *slot = s->ctex != nil ? &s->ctex->rt_srgb : &s->rt_srgb;
         if (*slot == nil)
@@ -309,8 +415,8 @@ static void begin_pass(D3DDevice *d)
             ca.clearColor = MTLClearColorMake(c[0], c[1], c[2], c[3]);
         }
         else
-            ca.loadAction = MTLLoadActionLoad;
-        ca.storeAction = MTLStoreActionStore;
+            ca.loadAction = s->discard ? MTLLoadActionDontCare : MTLLoadActionLoad;
+        ca.storeAction = s->discard ? MTLStoreActionDontCare : MTLStoreActionStore;
         if (s->scale != scale)
             rt_fatal("D3D9: render targets of %ux%u (%ux shadow resolution) and %ux%u (%ux) in one pass; set \"Shadow "
                      "Resolution\" to \"Game\" in the Video options",
@@ -368,9 +474,11 @@ static void begin_pass(D3DDevice *d)
             rp.stencilAttachment.texture = t;
             rp.stencilAttachment.slice = slice;
             rp.stencilAttachment.level = level;
-            rp.stencilAttachment.loadAction = d->clear_stencil ? MTLLoadActionClear : MTLLoadActionLoad;
+            rp.stencilAttachment.loadAction =
+                d->clear_stencil ? MTLLoadActionClear : s->stencil_idle ? MTLLoadActionDontCare : MTLLoadActionLoad;
             rp.stencilAttachment.clearStencil = d->clear_s & 0xFFu;
-            rp.stencilAttachment.storeAction = MTLStoreActionStore;
+            rp.stencilAttachment.storeAction = s->stencil_idle ? MTLStoreActionDontCare : MTLStoreActionStore;
+            if (s->stencil_idle && d->clear_stencil) s->stencil_value = (uint8_t)(d->clear_s & 0xFFu);
             d->pass_stencil = t.pixelFormat;
         }
         /* UNCONFIRMED: Metal accepts a depth attachment that is larger than
@@ -413,6 +521,28 @@ static void need_pass(D3DDevice *d)
 {
     if (d->enc != nil && d->pass_srgb != (d->rs[RS_SRGBWRITEENABLE] != 0)) d3d_end_pass(d);
     if (d->enc == nil) begin_pass(d);
+}
+
+/* Call after need_pass and before the first command of a draw with the
+   stencil test or of a stencil clear quad. Until then the passes of a
+   shadow map do not load or store its stencil (D3DSurface.stencil_idle),
+   so the stencil holds the last full clear value. This function marks the
+   stencil as used and starts the pass again with that clear value. The
+   color attachments and the depth are stored, except a memoryless color
+   target (D3DSurface.discard), whose contents are never read. */
+static void need_stencil(D3DDevice *d)
+{
+    D3DSurface *s;
+    if (d->ds == NULL || d->pass_stencil == MTLPixelFormatInvalid) return;
+    s = d3d_surf(d->ds);
+    if (!s->stencil_idle) return;
+    s->stencil_idle = false;
+    rt_log("D3D9: the stencil of a %ux%u shadow depth-stencil surface is used; its passes load and store it", s->width,
+           s->height);
+    d3d_end_pass(d);
+    d->clear_stencil = true;
+    d->clear_s = s->stencil_value;
+    need_pass(d);
 }
 
 /* ---------------------------------------------------------------- caches */
@@ -649,14 +779,15 @@ static id<MTLFunction> vs_function(D3DDevice *d, D3DShader *vs)
     return vs->vs_func;
 }
 
-static id<MTLFunction> ps_function(D3DDevice *d, D3DShader *ps, D3DShader *vs, uint16_t dmask)
+static id<MTLFunction> ps_function(D3DDevice *d, D3DShader *ps, D3DShader *vs, uint16_t dmask, uint32_t pcss,
+                                   bool contact)
 {
-    NSNumber *key = @((vs->id << 16) | dmask);
+    NSNumber *key = @(((uint64_t)vs->id << 19) | ((uint64_t)contact << 18) | ((uint64_t)pcss << 16) | dmask);
     id<MTLFunction> f = ps->ps_funcs[key];
     d3dsh_text t = { 0 };
     char err[256];
     if (f != nil) return f;
-    if (!d3d_shader_msl_ps(&ps->sh, vs->sh.outputs, vs->sh.noutputs, dmask, &t, err, sizeof err))
+    if (!d3d_shader_msl_ps(&ps->sh, vs->sh.outputs, vs->sh.noutputs, dmask, pcss, contact, &t, err, sizeof err))
         rt_fatal("D3D9: pixel shader translation failed: %s", err);
     @autoreleasepool
     {
@@ -680,6 +811,8 @@ typedef struct pipe_key {
     uint32_t blend, src, dst, op, src_a, dst_a, op_a;
     uint32_t wmask[D3D_MAX_RT];
     uint32_t depth_compare;
+    uint32_t pcss; /* RT_ENH_PCSS level of the pixel shader variant, 0 without comparison samplers */
+    uint32_t contact; /* 1: the pixel shader variant reads the contact shadows (rt_d3d9_sss.m) */
     uint32_t clear_flags, clear_mask;
 } pipe_key;
 
@@ -869,6 +1002,75 @@ static void clear_quads(D3DDevice *d, uint32_t flags, const int32_t (*rects)[4],
     enc_state_reset(d);
 }
 
+/* GT7 tone mapping (RT_ENH_TONEMAP) of the complete scene: a full-screen
+   draw in the current pass after the game's bloom composite. The draw
+   reads each pixel of color attachment 0 (framebuffer fetch) and writes
+   the tone-mapped value back, so the HUD that the game draws next does not
+   go through the curve. Once in each frame. */
+static void tonemap_scene(D3DDevice *d)
+{
+    pipe_key k;
+    MTLDepthStencilDescriptor *dd;
+    d3d_gt7_params g;
+    uint32_t dkey[2] = { 0x67740000u, 0 }, i;
+    id<MTLRenderPipelineState> p;
+    MTLViewport vp;
+    MTLScissorRect sr;
+    static int logged;
+    bool hdr = rt_enh_get(RT_ENH_HDR) != 0;
+    if (d->gt7_frame == d->present_count + 1u || d->enc == nil || d->pass_color[0] == MTLPixelFormatInvalid) return;
+    /* With HDR output, only the 16-bit float back buffer keeps the expanded
+       highlights. Until d3d_present makes it (and for another target), the
+       present shader applies the expansion and GT7. */
+    if (hdr && (d->rt[0] != d->backbuffer || d->backbuffer == NULL || !d3d_surf(d->backbuffer)->hdr)) return;
+    if (!d3d_post_gt7(&g, hdr, hdr ? d3d_post_headroom(d) : 1.0f)) return;
+    d->gt7_frame = d->present_count + 1u;
+    if (logged != (hdr ? 2 : 1))
+    {
+        rt_log("D3D9: GT7 tone mapping of the scene (%s), highlight expansion %.3f at white", hdr ? "HDR" : "SDR",
+               (double)g.expand);
+        logged = hdr ? 2 : 1;
+    }
+    g.srgb = is_srgb(d->pass_color[0]) ? 1u : 0u;
+    g.hdr = hdr ? 1u : 0u;
+    memset(&k, 0, sizeof k);
+    pass_key(d, &k);
+    k.kind = 3;
+    for (i = 0; i < D3D_MAX_RT; i++) k.wmask[i] = i == 0 ? 0xFu : 0u;
+    p = state_cache_get(d->pipelines, &k);
+    if (p == nil)
+    {
+        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+        pd.vertexFunction = function_of(d->builtin_lib, "present_vs");
+        pd.fragmentFunction = function_of(d->builtin_lib, "gt7_scene_fs");
+        p = make_pipeline(d, &k, pd);
+    }
+    [d->enc setRenderPipelineState:p];
+    dd = [MTLDepthStencilDescriptor new];
+    dd.depthCompareFunction = MTLCompareFunctionAlways;
+    dd.depthWriteEnabled = NO;
+    [d->enc setDepthStencilState:ds_state(d, dd, dkey, sizeof dkey)];
+    [d->enc setFragmentBytes:&g length:sizeof g atIndex:0];
+    vp.originX = 0;
+    vp.originY = 0;
+    vp.width = d->pass_w;
+    vp.height = d->pass_h;
+    vp.znear = 0;
+    vp.zfar = 1;
+    sr.x = 0;
+    sr.y = 0;
+    sr.width = d->pass_w;
+    sr.height = d->pass_h;
+    [d->enc setViewport:vp];
+    [d->enc setScissorRect:sr];
+    [d->enc setCullMode:MTLCullModeNone];
+    [d->enc setTriangleFillMode:MTLTriangleFillModeFill];
+    [d->enc setDepthBias:0 slopeScale:0 clamp:0];
+    [d->enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    d->enc_draws = true;
+    enc_state_reset(d);
+}
+
 static void color_of(uint32_t c, float rgba[4])
 {
     rgba[0] = (float)((c >> 16) & 0xFFu) / 255.0f;
@@ -953,6 +1155,7 @@ void rt_com_D3DDevice9_Clear(_cpu *cpu)
             return;
         }
         need_pass(d);
+        if (flags & D3DCLEAR_STENCIL) need_stencil(d);
         list = malloc(sizeof *list * (count ? count : 1u));
         if (list == NULL) rt_fatal("out of host memory (Clear)");
         if (count == 0)
@@ -1040,10 +1243,10 @@ static id<MTLSamplerState> sampler_for(D3DDevice *d, const uint32_t *ss, uint32_
     k.w = ss[SS_ADDRESSW];
     k.border = (k.u == 4 || k.v == 4 || k.w == 4) ? ss[SS_BORDERCOLOR] : 0;
     k.aniso = (k.min == 3 || k.mag == 3) ? ss[SS_MAXANISOTROPY] : 1;
-    /* Mac enhancement: 16x anisotropic filtering for the mipmapped textures
-       with linear filtering. Point-filtered textures (text, interface) and
-       depth comparison samplers (shadows) keep the game setting. */
-    if (rt_enh_get(RT_ENH_ANISOTROPY) != 0 && !compare && k.mip != 0 && k.min >= 2 && k.mag >= 2) k.aniso = 16;
+    /* 16x anisotropic filtering (always on) for the mipmapped textures with
+       linear filtering. Point-filtered textures (text, interface) and depth
+       comparison samplers (shadows) keep the game setting. */
+    if (!compare && k.mip != 0 && k.min >= 2 && k.mag >= 2) k.aniso = 16;
     lmin = ss[SS_MAXMIPLEVEL] > lod ? ss[SS_MAXMIPLEVEL] : lod;
     k.lodmin = lmin;
     k.compare = compare;
@@ -1354,6 +1557,7 @@ static uint32_t do_draw(D3DDevice *d, draw_info *di)
     MTLPrimitiveType mt;
     uint32_t n, s, e, i, instances = 1;
     uint16_t dmask = 0;
+    id<MTLTexture> contact = nil;
     MTLRenderPipelineDescriptor *pd;
     MTLViewport vp;
     float vs_misc[4], ps_misc[4];
@@ -1371,7 +1575,20 @@ static uint32_t do_draw(D3DDevice *d, draw_info *di)
         if (vs->sh.outputs[j].usage == D3DDECLUSAGE_PSIZE && vs->sh.outputs[j].index == 0) has_psize = true;
     if (mt == MTLPrimitiveTypePoint && !has_psize)
         rt_fatal("D3D9: point lists need a vertex shader that writes the point size");
+    /* Kawase bloom: the game's blur draws are skipped, and the composite
+       draw gets the Kawase blur first. */
+    if (!d3d_bloom_draw(d, ps)) return D3D_OK;
+    /* Ambient occlusion: the composite draw of the frame multiplies the
+       scene by the occlusion first; the scene draws give the camera. */
+    if (ps->sh.ct_scene_sampler >= 0) d3d_ao_apply(d, ps);
+    if (vs->sh.ct_wvp >= 0) d3d_ao_capture(d, vs);
+    for (s = 0; s < D3D_PS_SAMPLERS; s++)
+        if (ps->sh.sampler_type[s] == D3DSTT_2D && d->tex[s] != NULL && d3d_tex(d->tex[s])->f->depth)
+            dmask = (uint16_t)(dmask | (1u << s));
+    /* Contact shadows: draws that read the shadow map. */
+    if (dmask != 0) contact = d3d_sss_draw(d, vs, ps);
     need_pass(d);
+    if (d->rs[RS_STENCILENABLE]) need_stencil(d);
     check_states(d, ps, mt == MTLPrimitiveTypePoint);
 
     /* Pipeline key. */
@@ -1426,17 +1643,16 @@ static uint32_t do_draw(D3DDevice *d, draw_info *di)
     k.wmask[1] = d->rs[RS_COLORWRITEENABLE1] & 0xFu;
     k.wmask[2] = d->rs[RS_COLORWRITEENABLE2] & 0xFu;
     k.wmask[3] = d->rs[RS_COLORWRITEENABLE3] & 0xFu;
-    for (s = 0; s < D3D_PS_SAMPLERS; s++)
-        if (ps->sh.sampler_type[s] == D3DSTT_2D && d->tex[s] != NULL && d3d_tex(d->tex[s])->f->depth)
-            dmask = (uint16_t)(dmask | (1u << s));
     k.depth_compare = dmask;
+    k.pcss = dmask != 0 ? (uint32_t)rt_enh_get(RT_ENH_PCSS) : 0u;
+    k.contact = contact != nil;
     {
         id<MTLRenderPipelineState> p = state_cache_get(d->pipelines, &k);
         if (p == nil)
         {
             pd = [MTLRenderPipelineDescriptor new];
             pd.vertexFunction = vs_function(d, vs);
-            pd.fragmentFunction = ps_function(d, ps, vs, dmask);
+            pd.fragmentFunction = ps_function(d, ps, vs, dmask, k.pcss, k.contact != 0);
             pd.vertexDescriptor = vertex_desc(d, vs, dc, &k);
             p = make_pipeline(d, &k, pd);
         }
@@ -1445,6 +1661,7 @@ static uint32_t do_draw(D3DDevice *d, draw_info *di)
             [d->enc setRenderPipelineState:p];
             d->es_pipe = p;
         }
+        if (contact != nil) [d->enc setFragmentTexture:contact atIndex:D3DSH_CONTACT_TEXTURE];
     }
     {
         id<MTLDepthStencilState> dss = draw_ds_state(d);
@@ -1522,6 +1739,21 @@ static uint32_t do_draw(D3DDevice *d, draw_info *di)
     }
     vs_misc[0] = d->viewport[2] ? -1.0f / (float)d->viewport[2] : 0.0f;
     vs_misc[1] = d->viewport[3] ? 1.0f / (float)d->viewport[3] : 0.0f;
+    /* SMAA T2x: the subpixel jitter of the scene draws (shaders with the
+       world-view-projection matrix in a full-size pass of scale 1 with a
+       full-size viewport; not the shadow maps, the post-processing quads
+       or the HUD after the resolve). */
+    if (vs->sh.ct_wvp >= 0 && d->pass_scale == 1u && d->backbuffer != NULL && d->viewport[0] == 0 && d->viewport[1] == 0)
+    {
+        D3DSurface *bbs = d3d_surf(d->backbuffer);
+        float jit[2];
+        if (d->pass_w == bbs->width && d->pass_h == bbs->height && d->viewport[2] == bbs->width &&
+            d->viewport[3] == bbs->height && d3d_post_t2x_jitter(d, jit))
+        {
+            vs_misc[0] += 2.0f * jit[0] / (float)d->viewport[2];
+            vs_misc[1] -= 2.0f * jit[1] / (float)d->viewport[3];
+        }
+    }
     vs_misc[2] = d3d_f(d->rs[RS_DEPTHBIAS]);
     vs_misc[3] = 0.0f;
     if (!d->es_valid || memcmp(d->es_vs_misc, vs_misc, sizeof vs_misc) != 0)
@@ -1633,6 +1865,12 @@ static uint32_t do_draw(D3DDevice *d, draw_info *di)
         [d->enc drawPrimitives:mt vertexStart:di->start vertexCount:n];
     d->enc_draws = true;
     d->es_valid = true;
+    /* GT7 and SMAA T2x: the bloom composite completes the scene. */
+    if (ps->sh.ct_bloom_sampler >= 0)
+    {
+        tonemap_scene(d);
+        d3d_post_t2x(d);
+    }
     return D3D_OK;
 }
 
@@ -1850,6 +2088,9 @@ void rt_com_D3DDevice9_StretchRect(_cpu *cpu)
     {
         st = d3d_surface_texture(src, &ss, &sl);
         dt = d3d_surface_texture(dst, &ds, &dl);
+        /* From the HDR back buffer: its 8-bit copy. Into it: the formats
+           differ, so the copy is a draw. */
+        if (st != nil) st = d3d_hdr_sdr_copy(d, src, st);
         if (st == nil || dt == nil || src->pool != D3DPOOL_DEFAULT || dst->pool != D3DPOOL_DEFAULT ||
             !read_rect(ARG(2), src->width, src->height, sr) || !read_rect(ARG(4), dst->width, dst->height, dr) ||
             filter > 3 || dst->msaa > 0 || src->f->depth || dst->f->depth)
@@ -2056,6 +2297,85 @@ static void perf_frame(void)
     }
 }
 
+/* Draw all of src into dst (same size; a format conversion). */
+static void copy_draw(D3DDevice *d, id<MTLTexture> src, id<MTLTexture> dst, const char *what)
+{
+    static const float uv[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
+    pipe_key k;
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    id<MTLRenderCommandEncoder> e;
+    d3d_end_pass(d);
+    memset(&k, 0, sizeof k);
+    k.kind = 2;
+    k.color[0] = (uint32_t)dst.pixelFormat;
+    k.wmask[0] = 0xF;
+    k.samples = 1;
+    pd.vertexFunction = function_of(d->builtin_lib, "blit_vs");
+    pd.fragmentFunction = function_of(d->builtin_lib, "blit_fs");
+    rp.colorAttachments[0].texture = dst;
+    rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    e = [d->cb renderCommandEncoderWithDescriptor:rp];
+    if (e == nil) rt_fatal("D3D9: %s encoder creation failed", what);
+    e.label = @(what);
+    [e setRenderPipelineState:make_pipeline(d, &k, pd)];
+    [e setVertexBytes:uv length:sizeof uv atIndex:0];
+    [e setFragmentTexture:src atIndex:0];
+    [e setFragmentSamplerState:d->present_point atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [e endEncoding];
+}
+
+id<MTLTexture> d3d_hdr_sdr_copy(D3DDevice *d, D3DSurface *s, id<MTLTexture> t)
+{
+    id<MTLTexture> c = d->hdr_sdr;
+    if (!s->hdr) return t;
+    if (c == nil || c.width != t.width || c.height != t.height || c.pixelFormat != s->f->pf)
+    {
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:s->f->pf width:t.width
+                                                                                     height:t.height mipmapped:NO];
+        td.storageMode = MTLStorageModePrivate;
+        td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+        c = [d->mtl newTextureWithDescriptor:td];
+        if (c == nil) rt_fatal("D3D9: out of video memory (8-bit copy of the HDR back buffer)");
+        d->hdr_sdr = c;
+    }
+    copy_draw(d, t, c, "HDR back buffer to 8 bits");
+    return c;
+}
+
+/* HDR and GT7 on: the back buffer becomes a 16-bit float texture, so the
+   GT7 scene pass can keep the highlights above the SDR white and the HUD
+   that the game draws next stays at the SDR white. Off: the format of the
+   D3D format again. Only for a single-sample back buffer that the game
+   cannot lock, with a BGRA8 format. The contents go into the new texture. */
+static void backbuffer_format(D3DDevice *d, D3DSurface *bb)
+{
+    bool want = rt_enh_get(RT_ENH_HDR) != 0 && rt_enh_get(RT_ENH_TONEMAP) != 0 && !bb->lockable && bb->ctex == nil &&
+                bb->tex != nil && bb->tex.sampleCount == 1 && bb->f->pf == MTLPixelFormatBGRA8Unorm;
+    MTLTextureDescriptor *td;
+    id<MTLTexture> t;
+    if (want == bb->hdr) return;
+    td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:want ? MTLPixelFormatRGBA16Float : bb->f->pf
+                                                            width:bb->tex.width
+                                                           height:bb->tex.height
+                                                        mipmapped:NO];
+    td.storageMode = MTLStorageModePrivate;
+    td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+    if (!want && (bb->f->swizzle || bb->f->pf_srgb != MTLPixelFormatInvalid)) td.usage |= MTLTextureUsagePixelFormatView;
+    t = [d->mtl newTextureWithDescriptor:td];
+    if (t == nil) rt_fatal("D3D9: out of video memory (%s back buffer %lux%lu)", want ? "16-bit float" : "8-bit",
+                           (unsigned long)td.width, (unsigned long)td.height);
+    copy_draw(d, bb->tex, t, "back buffer format change");
+    bb->tex = t;
+    bb->rt_srgb = nil;
+    bb->hdr = want;
+    if (!want) d->hdr_sdr = nil;
+    rt_log("D3D9: back buffer %ux%u is %s", bb->width, bb->height,
+           want ? "16-bit float (HDR with GT7 tone mapping of the scene)" : "8-bit");
+}
+
 void d3d_present(D3DDevice *d)
 {
     @autoreleasepool
@@ -2102,9 +2422,17 @@ void d3d_present(D3DDevice *d)
             MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
             id<MTLRenderCommandEncoder> e;
             MTLViewport vp;
-            struct { uint32_t use_lut, hdr; float headroom; uint32_t src_linear; } pp_args = { 0, 0, 1.0f, 0 };
+            struct
+            {
+                uint32_t use_lut, hdr;
+                float headroom;
+                uint32_t src_linear, gt7, scene;
+                d3d_gt7_params g;
+            } pp_args;
             double dw = size.width, dh = size.height, bw = bb->width, bh = bb->height;
             MTLPixelFormat dfmt = dr.texture.pixelFormat;
+            memset(&pp_args, 0, sizeof pp_args);
+            pp_args.headroom = 1.0f;
             if (d->pp[PP_WINDOWED])
             {
                 /* Windowed: the back buffer fills the client area. */
@@ -2132,6 +2460,14 @@ void d3d_present(D3DDevice *d)
                 rt_fatal("D3D9: the drawable has the pixel format %lu (expected BGRA8Unorm or RGBA16Float)", (unsigned long)dfmt);
             pp_args.hdr = dfmt == MTLPixelFormatRGBA16Float;
             pp_args.headroom = headroom;
+            /* A frame with the scene pass: the HDR back buffer has the
+               tone-mapped scene (scene), or the SDR scene pass ran. Else GT7
+               in HDR mode after the EDR expansion, with the peak at the
+               headroom. */
+            pp_args.scene = pp_args.hdr && d->gt7_frame == d->present_count + 1u && bb->hdr ? 1u : 0u;
+            pp_args.gt7 = pp_args.hdr && d->gt7_frame != d->present_count + 1u && d3d_post_gt7(&pp_args.g, true, headroom)
+                              ? 1u
+                              : 0u;
             pp_args.src_linear = src.pixelFormat == MTLPixelFormatBGRA8Unorm_sRGB || src.pixelFormat == MTLPixelFormatRGBA8Unorm_sRGB;
             rp.colorAttachments[0].texture = dr.texture;
             rp.colorAttachments[0].loadAction = MTLLoadActionClear;
@@ -2156,6 +2492,8 @@ void d3d_present(D3DDevice *d)
                 rt_log("D3D9: Present: the window has no drawable (zero size); the frame is not shown");
             logged = true;
         }
+        d3d_post_frame_end(d);
+        backbuffer_format(d, bb);
         bb->last_use = d->serial;
         /* At most D3D_FRAMES_IN_FLIGHT frames are queued. */
         slot = d->present_count % D3D_FRAMES_IN_FLIGHT;

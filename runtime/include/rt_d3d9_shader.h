@@ -90,7 +90,33 @@ typedef struct d3d_shader {
        draw sends only these registers. */
     uint16_t nconst_f;
     uint8_t color_outputs; /* bit n: oC#n written */
+    /* Values from the constant table (the "CTAB" comment that the D3DX
+       compiler writes) for the ambient occlusion pass (rt_d3d9_ao.m).
+       ct_wvp and ct_world: the first float register of the 4-register
+       matrices p3dWorldViewProjectionMatrix and p3dWorldMatrix, or -1.
+       ct_wvp_class and ct_world_class: the matrix class of the table
+       (D3DSH_CLASS_MATRIX_ROWS or D3DSH_CLASS_MATRIX_COLUMNS).
+       ct_scene_sampler: the sampler of p3dFrameBufferCurrent in the pixel
+       shader that adds the bloom (it also has BloomedScene and
+       BloomStrength), or -1 in all other shaders.
+       ct_bloom_sampler: the sampler of BloomedScene in that shader, or -1.
+       ct_shadow and ct_shadow_class: the first float register and the class
+       of the 4-register matrix p3dShadowMapMatrix (pixel shaders that read
+       the shadow map), or -1.
+       ct_role: D3DSH_ROLE_* (rt_d3d9_bloom.m). */
+    int16_t ct_wvp, ct_world, ct_shadow;
+    uint8_t ct_wvp_class, ct_world_class, ct_shadow_class;
+    int8_t ct_scene_sampler, ct_bloom_sampler;
+    uint8_t ct_role;
 } d3d_shader;
+
+/* Roles of game pixel shaders, from the names in the constant table. */
+#define D3DSH_ROLE_NONE 0u
+#define D3DSH_ROLE_BLOOM_BRIGHT 1u /* bloom bright pass: p3dFrameBufferCurrent, Cutoff, FalloffPower */
+#define D3DSH_ROLE_BLOOM_BLUR 2u   /* bloom blur: p3dFrameBufferCurrent, BlurOffset1, BlurWeight1 */
+
+#define D3DSH_CLASS_MATRIX_ROWS 2u
+#define D3DSH_CLASS_MATRIX_COLUMNS 3u
 
 /* Dynamic text buffer for the generated source. */
 typedef struct d3dsh_text {
@@ -113,8 +139,13 @@ bool d3d_shader_msl_vs(const d3d_shader *vs, d3dsh_text *out, char *err, size_t 
    vs_outputs/nvs are the outputs of the vertex shader (inputs that the
    vertex shader does not write read 0); depth_compare bit n makes sampler
    n a comparison sampler on a depth texture (the result is the compare
-   result, as with a D3D9 depth texture). */
+   result, as with a D3D9 depth texture). pcss 1 or 2 replaces each
+   comparison sample with percentage-closer soft shadows (PCSS) of the low
+   or the high level (rt_enh.h RT_ENH_PCSS); 0 keeps the single sample.
+   contact true multiplies each comparison result by the screen-space
+   contact shadow of the pixel (texture D3DSH_CONTACT_TEXTURE, rt_d3d9_sss.m). */
+#define D3DSH_CONTACT_TEXTURE 16u
 bool d3d_shader_msl_ps(const d3d_shader *ps, const d3dsh_io *vs_outputs, int nvs, uint16_t depth_compare,
-                       d3dsh_text *out, char *err, size_t errn);
+                       uint32_t pcss, bool contact, d3dsh_text *out, char *err, size_t errn);
 
 #endif

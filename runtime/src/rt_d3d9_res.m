@@ -301,7 +301,9 @@ static MTLTextureDescriptor *texture_desc(D3DDevice *d, const d3d_format *f, boo
     td.storageMode = (usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)) || f->depth || samples > 1
                          ? MTLStorageModePrivate
                          : MTLStorageModeShared;
-    if (samples > 1) td.usage = MTLTextureUsageRenderTarget;
+    /* A multisampled depth-stencil texture is also readable: the ambient
+       occlusion pass (rt_d3d9_ao.m) reads sample 0 of the depth. */
+    if (samples > 1) td.usage = MTLTextureUsageRenderTarget | (f->depth ? MTLTextureUsageShaderRead : 0);
     return td;
 }
 
@@ -774,6 +776,7 @@ static uint32_t child_surface(D3DTexture *t, uint32_t fc, uint32_t l, uint32_t o
         s->width = t->lw[l];
         s->height = t->lh[l];
         s->scale = t->scale;
+        s->stencil_idle = t->scale > 1 && t->f->depth && t->f->stencil;
         so = make_object(&d3d_surface_class, s);
         s->com = so;
         t->surf[fc][l] = so;
@@ -972,15 +975,24 @@ uint32_t d3d_create_surface(D3DDevice *d, uint32_t w, uint32_t h, uint32_t fmt, 
     }
     else
     {
-        s->tex = [d->mtl newTextureWithDescriptor:texture_desc(d, f, false, w * s->scale, h * s->scale, 1, usage, samples)];
+        MTLTextureDescriptor *td = texture_desc(d, f, false, w * s->scale, h * s->scale, 1, usage, samples);
+        s->discard = s->scale > 1 && (usage & D3DUSAGE_RENDERTARGET) && !f->depth && samples <= 1;
+        s->stencil_idle = s->scale > 1 && f->depth && f->stencil && samples <= 1;
+        if (s->discard)
+        {
+            td.storageMode = MTLStorageModeMemoryless;
+            td.usage = MTLTextureUsageRenderTarget;
+        }
+        s->tex = [d->mtl newTextureWithDescriptor:td];
         if (s->tex == nil) return D3DERR_OUTOFVIDEOMEMORY;
     }
     *out_obj = make_object(&d3d_surface_class, s);
     s->com = *out_obj;
     if (usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL))
-        rt_log("D3D9: %s surface %ux%u, format 0x%08x, %u samples%s",
+        rt_log("D3D9: %s surface %ux%u, format 0x%08x, %u samples%s%s",
                (usage & D3DUSAGE_DEPTHSTENCIL) ? "depth-stencil" : "render target", w, h, fmt, msaa,
-               s->scale == 4 ? ", 4x shadow resolution" : s->scale == 2 ? ", 2x shadow resolution" : "");
+               s->scale == 4 ? ", 4x shadow resolution" : s->scale == 2 ? ", 2x shadow resolution" : "",
+               s->discard ? ", memoryless" : "");
     return D3D_OK;
 }
 
@@ -1301,6 +1313,8 @@ uint32_t d3d_readback(D3DDevice *d, D3DSurface *src, D3DSurface *dst)
     if (tex == nil || src->msaa > 0 || src->width != dst->width || src->height != dst->height || src->fmt != dst->fmt ||
         !sysmem_of(dst, &mem, &pitch))
         return D3DERR_INVALIDCALL;
+    /* The HDR back buffer: its 8-bit copy (the D3D format). */
+    tex = d3d_hdr_sdr_copy(d, src, tex);
     read_pixels(d, tex, slice, level, src->f, src->width, src->height, mem, pitch, surface_last_use(src));
     return D3D_OK;
 }
@@ -1310,6 +1324,9 @@ uint32_t d3d_update_surface(D3DDevice *d, D3DSurface *src, uint32_t src_rect, D3
     uint32_t mem, pitch, x0 = 0, y0 = 0, w = src->width, h = src->height, dx = 0, dy = 0, off;
     NSUInteger slice, level;
     d3d_check_unscaled(dst, "UpdateSurface");
+    if (dst->hdr)
+        rt_fatal("D3D9: UpdateSurface into the 16-bit float back buffer of HDR with GT7 tone mapping is not supported; "
+                 "set \"Tone Mapping\" or \"HDR\" to off in the Video options");
     id<MTLTexture> tex = d3d_surface_texture(dst, &slice, &level);
     if (tex == nil || dst->pool != D3DPOOL_DEFAULT || src->fmt != dst->fmt || !sysmem_of(src, &mem, &pitch))
         return D3DERR_INVALIDCALL;
