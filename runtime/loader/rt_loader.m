@@ -1,13 +1,14 @@
 /*
  * The loader: the executable of Prototype.app.
  *
- * 1. Find the game directory. The first directory that holds the game files:
- *    a. the directory given with "--game-dir <path>",
- *    b. the folder "Put game files here" beside the application,
- *    c. the folder that holds the application,
- *    d. the folder that the player selected before.
- *    If none holds the game files, or the Option key is held at start, the
- *    player selects the folder in an open panel.
+ * 1. Find the game directory.
+ *    - With "--game-dir <path>", use that directory. The launcher window
+ *      does not open.
+ *    - Else the launcher window opens (rt_launcher.m). The loader does not
+ *      look for the game files. The window shows the folder that the
+ *      player selected before, or no folder on the first start. The player
+ *      selects the folder with "Choose Folder…" and can change the Mac
+ *      settings. Play starts the game; a closed window quits.
  * 2. Check the SHA-256 values of prototypef.exe and prototypeenginef.dll.
  *    Only the Steam version is supported, because the converter output is
  *    tested for these files.
@@ -32,6 +33,7 @@
 
 #include "rt_convert.h"
 #include "rt_game.h"
+#include "rt_launcher.h"
 
 #include <CommonCrypto/CommonDigest.h>
 #include <copyfile.h>
@@ -52,7 +54,6 @@
 #endif
 
 #define PORT_NAME "Prototype Mac Port"
-#define GAME_FOLDER_NAME "Put game files here"
 #define DEFAULTS_GAME_DIR @"GameDirectory"
 #define PATH_LEN 1024
 
@@ -179,43 +180,52 @@ static bool copy_path(char *out, size_t n, const char *in)
     return (size_t)snprintf(out, n, "%s", in) < n;
 }
 
-/* The open panel. Returns false if the player cancelled. */
-static bool pick_dir(char *out, size_t n)
+/* The problem of the SHA-256 values of the game files in dir, or nil. */
+static NSString *hash_problem(const char *dir, NSString **title)
 {
-    ensure_app();
-    for (;;)
+    size_t i;
+    for (i = 0; i < NPINNED; i++)
     {
-        NSOpenPanel *panel = [NSOpenPanel openPanel];
-        NSString *why = nil;
-        const char *path;
-        panel.canChooseDirectories = YES;
-        panel.canChooseFiles = NO;
-        panel.allowsMultipleSelection = NO;
-        panel.prompt = @"Select";
-        panel.message = @"Select the installed game folder of the Steam version of Prototype (the folder that holds "
-                        @"prototypef.exe).";
-        [NSApp activate];
-        if ([panel runModal] != NSModalResponseOK || panel.URL == nil) return false;
-        path = panel.URL.fileSystemRepresentation;
-        if (path == NULL || !copy_path(out, n, path))
+        char path[PATH_LEN], sum[65], err[512];
+        if (!join(path, sizeof path, dir, pinned[i].name))
         {
-            show_alert(@"The folder path is too long.", @"Select a folder with a shorter path.", NSAlertStyleWarning);
-            continue;
+            *title = @"The game folder path is too long.";
+            return str(dir);
         }
-        if (check_dir(out, &why)) return true;
-        show_alert(@"This folder cannot be used.", why, NSAlertStyleWarning);
+        if (!rt_sha256_file(path, sum, err, sizeof err))
+        {
+            *title = @"A game file cannot be read.";
+            return str(err);
+        }
+        if (strcmp(sum, pinned[i].sha256) != 0)
+        {
+            *title = [NSString stringWithFormat:@"%s is not the supported version.", pinned[i].name];
+            return [NSString stringWithFormat:@"This port supports only the Steam version of Prototype. The file %s has "
+                                              @"the SHA-256 value %s; the supported file has %s.",
+                                              path, sum, pinned[i].sha256];
+        }
     }
+    return nil;
+}
+
+/* The check of the launcher window: the problem of dir for the player, or
+   nil if the game can start from dir. */
+static NSString *dir_problem(const char *dir)
+{
+    NSString *why = nil, *title = nil, *problem;
+    if (!check_dir(dir, &why)) return why;
+    problem = hash_problem(dir, &title);
+    if (problem == nil) return nil;
+    return [NSString stringWithFormat:@"%@ %@", title, problem];
 }
 
 static void find_game_dir(int argc, char **argv, char *out, size_t n)
 {
-    NSString *bundle = NSBundle.mainBundle.bundlePath;
-    NSString *parent = bundle.stringByDeletingLastPathComponent;
     NSString *remembered = [NSUserDefaults.standardUserDefaults stringForKey:DEFAULTS_GAME_DIR];
-    char beside[PATH_LEN], resolved[PATH_LEN];
-    const char *candidates[3];
-    int i, nc = 0;
-    bool option = (NSEvent.modifierFlags & NSEventModifierFlagOption) != 0;
+    const char *home = getenv("HOME");
+    char found[PATH_LEN], settings[PATH_LEN];
+    const char *initial = NULL;
+    int i;
 
     for (i = 1; i < argc; i++)
     {
@@ -227,40 +237,22 @@ static void find_game_dir(int argc, char **argv, char *out, size_t n)
         if (!check_dir(out, &why)) fail(@"The game folder cannot be used.", why);
         return;
     }
-    if (bundle == nil || parent.fileSystemRepresentation == NULL)
-        fail(@"The location of the application is not known.", @"Move the application to a different folder.");
-    if (!option)
-    {
-        if (join(beside, sizeof beside, parent.fileSystemRepresentation, GAME_FOLDER_NAME))
-            candidates[nc++] = beside;
-        candidates[nc++] = parent.fileSystemRepresentation;
-        if (remembered != nil && remembered.fileSystemRepresentation != NULL)
-            candidates[nc++] = remembered.fileSystemRepresentation;
-        for (i = 0; i < nc; i++)
-        {
-            if (realpath(candidates[i], resolved) == NULL || !check_dir(resolved, NULL)) continue;
-            if (!copy_path(out, n, resolved)) continue;
-            return;
-        }
-    }
-    if (!pick_dir(out, n)) exit(0);
+    if (home == NULL || !join(settings, sizeof settings, home, "Library/Application Support/" PORT_NAME "/enhancements.txt"))
+        fail(@"The home folder is not known.", @"The HOME variable is not set or is too long.");
+    /* The folder that the player selected before. The window checks it and
+       shows its problem if its files were moved or removed. */
+    if (remembered != nil && remembered.fileSystemRepresentation != NULL &&
+        copy_path(found, sizeof found, remembered.fileSystemRepresentation))
+        initial = found;
+    ensure_app();
+    if (!rt_launcher_run(settings, initial, dir_problem, out, n)) exit(0);
     [NSUserDefaults.standardUserDefaults setObject:str(out) forKey:DEFAULTS_GAME_DIR];
 }
 
 static void check_game_files(const char *dir)
 {
-    size_t i;
-    for (i = 0; i < NPINNED; i++)
-    {
-        char path[PATH_LEN], sum[65], err[512];
-        if (!join(path, sizeof path, dir, pinned[i].name)) fail(@"The game folder path is too long.", str(dir));
-        if (!rt_sha256_file(path, sum, err, sizeof err)) fail(@"A game file cannot be read.", str(err));
-        if (strcmp(sum, pinned[i].sha256) != 0)
-            fail([NSString stringWithFormat:@"%s is not the supported version.", pinned[i].name],
-                 [NSString stringWithFormat:@"This port supports only the Steam version of Prototype. The file %s has "
-                                            @"the SHA-256 value %s; the supported file has %s.",
-                                            path, sum, pinned[i].sha256]);
-    }
+    NSString *title = nil, *problem = hash_problem(dir, &title);
+    if (problem != nil) fail(title, problem);
 }
 
 /* ---------------------------------------------------------------- conversion (release build) */
@@ -310,6 +302,17 @@ static void check_game_files(const char *dir)
     self.closed = YES;
     rt_convert_cancel();
     return YES;
+}
+
+/* The quit Apple event (Quit in the Dock, log out, shut down) does what
+   the close button does. AppKit installs its own handler only in
+   finishLaunching, which the runtime calls when the game starts. */
+- (void)handleQuitEvent:(NSAppleEventDescriptor *)event withReplyEvent:(NSAppleEventDescriptor *)reply
+{
+    (void)event;
+    (void)reply;
+    self.closed = YES;
+    rt_convert_cancel();
 }
 @end
 
@@ -369,9 +372,14 @@ static bool remove_tree(const char *path, char *err, size_t errn)
 }
 
 /* Remove the quarantine attribute from each file of the copy of the
-   Recompiler directory, so that the tools can run. */
+   Recompiler directory, so that the tools can run. macOS removes an
+   attribute only if the owner can write the file. Some files of the
+   release are read-only (libclang_rt.osx.a has mode 0444), so a read-only
+   file or folder of the copy (the copy belongs to the loader) gets the
+   write permission of the owner before the removal. */
 static void strip_quarantine(const char *root)
 {
+    static const char attr[] = "com.apple.quarantine";
     char *paths[2] = { (char *)root, NULL };
     FTS *fts = fts_open(paths, FTS_PHYSICAL | FTS_NOCHDIR, NULL);
     FTSENT *e;
@@ -381,9 +389,18 @@ static void strip_quarantine(const char *root)
         if (e->fts_info == FTS_DP) continue;
         if (e->fts_info == FTS_ERR || e->fts_info == FTS_DNR || e->fts_info == FTS_NS)
             fail(@"The converter cannot be prepared.", str(strerror(e->fts_errno)));
-        if (removexattr(e->fts_path, "com.apple.quarantine", XATTR_NOFOLLOW) != 0 && errno != ENOATTR)
+        if (getxattr(e->fts_path, attr, NULL, 0, 0, XATTR_NOFOLLOW) < 0)
+        {
+            if (errno == ENOATTR) continue;
             fail(@"The converter cannot be prepared.",
                  [NSString stringWithFormat:@"%s: %s", e->fts_path, strerror(errno)]);
+        }
+        if (removexattr(e->fts_path, attr, XATTR_NOFOLLOW) == 0) continue;
+        if (errno == EACCES && !S_ISLNK(e->fts_statp->st_mode) && (e->fts_statp->st_mode & S_IWUSR) == 0 &&
+            chmod(e->fts_path, (e->fts_statp->st_mode & 07777) | S_IWUSR) == 0 &&
+            removexattr(e->fts_path, attr, XATTR_NOFOLLOW) == 0)
+            continue;
+        fail(@"The converter cannot be prepared.", [NSString stringWithFormat:@"%s: %s", e->fts_path, strerror(errno)]);
     }
     fts_close(fts);
 }
@@ -485,6 +502,10 @@ static void get_bundle(const char *game_dir, char *bundle, size_t n)
         pthread_create(&th, &attr, convert_thread, s) != 0)
         fail(@"The conversion cannot start.", @"A thread cannot be made.");
     pthread_attr_destroy(&attr);
+    [NSAppleEventManager.sharedAppleEventManager setEventHandler:ui
+                                                     andSelector:@selector(handleQuitEvent:withReplyEvent:)
+                                                   forEventClass:kCoreEventClass
+                                                      andEventID:kAEQuitApplication];
     while (!atomic_load(&s->finished))
     {
         @autoreleasepool
@@ -496,6 +517,8 @@ static void get_bundle(const char *game_dir, char *bundle, size_t n)
             if (e != nil && e.type != NSEventTypeApplicationDefined) [NSApp sendEvent:e];
         }
     }
+    [NSAppleEventManager.sharedAppleEventManager removeEventHandlerForEventClass:kCoreEventClass
+                                                                  andEventID:kAEQuitApplication];
     if (pthread_join(th, NULL) != 0) fail(@"The conversion failed.", @"pthread_join failed.");
     [ui.window orderOut:nil];
     if (!s->ok)
@@ -514,6 +537,9 @@ static void get_bundle(const char *game_dir, char *bundle, size_t n)
     f = fopen(marker, "w");
     if (f == NULL || fprintf(f, "%s\n", key) < 0 || fclose(f) != 0)
         fail(@"The converted game code cannot be recorded.", [NSString stringWithFormat:@"%s: %s", marker, strerror(errno)]);
+    /* A quit or a close that came after the conversion completed: keep the
+       result for the next start, but do not start the game. */
+    if (ui.closed) exit(0);
 }
 
 #else

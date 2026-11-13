@@ -764,8 +764,12 @@ static MTLVertexFormat vertex_format(uint32_t type, uint32_t *size)
 
 /* ---------------------------------------------------------------- shaders */
 
+/* vs_function and ps_function run on the render thread and on the
+   pipeline cache threads; the shader object is the lock of its functions. */
 static id<MTLFunction> vs_function(D3DDevice *d, D3DShader *vs)
 {
+    @synchronized(vs)
+    {
     d3dsh_text t = { 0 };
     char err[256];
     if (vs->vs_func != nil) return vs->vs_func;
@@ -777,11 +781,14 @@ static id<MTLFunction> vs_function(D3DDevice *d, D3DShader *vs)
     }
     d3dsh_text_free(&t);
     return vs->vs_func;
+    }
 }
 
 static id<MTLFunction> ps_function(D3DDevice *d, D3DShader *ps, D3DShader *vs, uint16_t dmask, uint32_t pcss,
                                    bool contact)
 {
+    @synchronized(ps)
+    {
     NSNumber *key = @(((uint64_t)vs->id << 19) | ((uint64_t)contact << 18) | ((uint64_t)pcss << 16) | dmask);
     id<MTLFunction> f = ps->ps_funcs[key];
     d3dsh_text t = { 0 };
@@ -798,6 +805,7 @@ static id<MTLFunction> ps_function(D3DDevice *d, D3DShader *ps, D3DShader *vs, u
     cache_limit(ps->ps_funcs, MAX_PS_VARIANTS, "pixel shader variant");
     ps->ps_funcs[key] = f;
     return f;
+    }
 }
 
 /* ---------------------------------------------------------------- pipelines */
@@ -1289,7 +1297,7 @@ static void bind_texture(D3DDevice *d, uint32_t slot, uint32_t st, bool vertex, 
     if (st == D3DSTT_UNKNOWN) rt_fatal("D3D9: sampler %u has no declared texture type", slot);
     if (o != NULL)
     {
-        D3DTexture *t = d3d_tex(o);
+        __unsafe_unretained D3DTexture *t = d3d_tex(o); /* d->tex[slot] keeps it */
         uint32_t tt = t->cube ? D3DSTT_CUBE : t->volume ? D3DSTT_VOLUME : D3DSTT_2D;
         /* Direct3D 9 does not fail a draw whose texture type is not the
            declared sampler type; the samples are undefined. The sampler
@@ -1371,6 +1379,317 @@ static bool prim_count(uint32_t type, uint32_t prims, MTLPrimitiveType *mt, uint
 
 /* Render states that the runtime does not implement stop the process when
    a draw uses them. */
+/* ---------------------------------------------------------------- pipeline cache */
+
+/* The pipeline cache keeps a recipe of each draw pipeline that the game
+   used: the hashes of the two shaders, the vertex declaration and the
+   pipeline key without the object ids. The file (rt_d3d9_pipeline_cache_init)
+   keeps the recipes between runs. When the game creates the shaders and the
+   declaration of a recipe (usually on a loading screen), a background
+   thread builds the pipeline, so the first draw with it does not wait for
+   the Metal compiler. Metal keeps the compiled code in its own cache; the
+   recipes tell which pipelines to build before the draws need them.
+
+   File: the header (magic, version, recipe size), then the recipes. A file
+   with a different header is a cache of a different runtime version; the
+   cache then starts again with an empty file. A recipe that is not complete
+   at the end of the file (the process stopped during a write) is removed. */
+static MTLVertexDescriptor *vertex_desc(D3DDevice *d, const D3DShader *vs, const D3DDecl *dc, const pipe_key *k);
+
+#define PCACHE_MAGIC 0x50434331u /* "1CCP" */
+#define PCACHE_VERSION 1u
+#define PCACHE_MAX 16384u        /* recipes; about 11 MiB */
+#define PCACHE_THREADS 3
+
+typedef struct pc_recipe {
+    uint8_t vs_hash[16], ps_hash[16];
+    uint32_t decl_n;
+    d3d_velem decl[64];
+    pipe_key k; /* vs, ps and decl are 0 */
+} pc_recipe;
+
+/* The state of a pipeline in pc.built. */
+#define PC_QUEUED @0
+#define PC_BUILDING @1
+
+static struct
+{
+    pthread_mutex_t lock;
+    pthread_cond_t done;
+    bool ready;
+    char path[1024];
+    FILE *f;
+    pc_recipe *r; /* the recipes from the file */
+    uint32_t n;
+    bool *started;
+    uint32_t total; /* recipes in the file, with the new ones */
+    bool full_logged;
+    NSMutableSet<NSData *> *known;                                     /* recipe bytes */
+    NSMutableDictionary<NSData *, NSMutableArray<NSNumber *> *> *by_obj; /* shader hash or declaration -> recipes */
+    NSMapTable<NSData *, D3DShader *> *shaders;                         /* hash -> live shader */
+    NSMapTable<NSData *, D3DDecl *> *decls;                             /* elements -> live declaration */
+    NSMutableDictionary<NSData *, id> *built; /* pipeline key -> pipeline, PC_QUEUED or PC_BUILDING */
+    NSOperationQueue *q;
+    uint32_t n_queued, n_built, n_used, n_back;
+} pc = { .lock = PTHREAD_MUTEX_INITIALIZER, .done = PTHREAD_COND_INITIALIZER };
+
+static void pc_lock(void)
+{
+    if (pthread_mutex_lock(&pc.lock) != 0) rt_fatal("D3D9: pipeline cache lock failed");
+}
+
+static void pc_unlock(void)
+{
+    if (pthread_mutex_unlock(&pc.lock) != 0) rt_fatal("D3D9: pipeline cache unlock failed");
+}
+
+static NSData *pc_decl_key(const d3d_velem *el, uint32_t n)
+{
+    return [NSData dataWithBytes:el length:n * sizeof el[0]];
+}
+
+static void pc_index(NSData *obj, uint32_t i)
+{
+    NSMutableArray<NSNumber *> *a = pc.by_obj[obj];
+    if (a == nil)
+    {
+        a = [NSMutableArray new];
+        pc.by_obj[obj] = a;
+    }
+    [a addObject:@(i)];
+}
+
+static void pc_write_header(void)
+{
+    uint32_t h[3] = { PCACHE_MAGIC, PCACHE_VERSION, (uint32_t)sizeof(pc_recipe) };
+    if (fwrite(h, sizeof h, 1, pc.f) != 1 || fflush(pc.f) != 0)
+        rt_fatal("D3D9: the pipeline cache %s cannot be written: %s", pc.path, strerror(errno));
+}
+
+void rt_d3d9_pipeline_cache_init(const char *path)
+{
+    uint32_t h[3];
+    long size;
+    size_t i;
+    int r = snprintf(pc.path, sizeof pc.path, "%s", path);
+    if (r <= 0 || (size_t)r >= sizeof pc.path) rt_fatal("D3D9: the pipeline cache path %s is too long", path);
+    pc.known = [NSMutableSet new];
+    pc.by_obj = [NSMutableDictionary new];
+    pc.shaders = [NSMapTable strongToWeakObjectsMapTable];
+    pc.decls = [NSMapTable strongToWeakObjectsMapTable];
+    pc.built = [NSMutableDictionary new];
+    pc.q = [NSOperationQueue new];
+    pc.q.maxConcurrentOperationCount = PCACHE_THREADS;
+    pc.q.qualityOfService = NSQualityOfServiceUserInitiated;
+    pc.q.name = @"D3D9 pipeline cache";
+    pc.f = fopen(pc.path, "r+b");
+    if (pc.f == NULL)
+    {
+        if (errno != ENOENT) rt_fatal("D3D9: the pipeline cache %s cannot be opened: %s", pc.path, strerror(errno));
+        pc.f = fopen(pc.path, "w+b");
+        if (pc.f == NULL) rt_fatal("D3D9: the pipeline cache %s cannot be created: %s", pc.path, strerror(errno));
+        pc_write_header();
+        pc.ready = true;
+        rt_log("D3D9: pipeline cache %s is new", pc.path);
+        return;
+    }
+    if (fseek(pc.f, 0, SEEK_END) != 0 || (size = ftell(pc.f)) < 0 || fseek(pc.f, 0, SEEK_SET) != 0)
+        rt_fatal("D3D9: the pipeline cache %s cannot be read: %s", pc.path, strerror(errno));
+    if ((size_t)size < sizeof h || fread(h, sizeof h, 1, pc.f) != 1 || h[0] != PCACHE_MAGIC || h[1] != PCACHE_VERSION ||
+        h[2] != sizeof(pc_recipe))
+    {
+        rt_log("D3D9: pipeline cache %s is from a different runtime version; it starts again", pc.path);
+        if (ftruncate(fileno(pc.f), 0) != 0 || fseek(pc.f, 0, SEEK_SET) != 0)
+            rt_fatal("D3D9: the pipeline cache %s cannot be cleared: %s", pc.path, strerror(errno));
+        pc_write_header();
+        pc.ready = true;
+        return;
+    }
+    {
+        size_t count = ((size_t)size - sizeof h) / sizeof(pc_recipe);
+        size_t whole = sizeof h + count * sizeof(pc_recipe);
+        if (count > PCACHE_MAX) count = PCACHE_MAX;
+        pc.r = calloc(count ? count : 1, sizeof(pc_recipe));
+        pc.started = calloc(count ? count : 1, sizeof(bool));
+        if (pc.r == NULL || pc.started == NULL) rt_fatal("D3D9: out of memory (pipeline cache)");
+        if (count > 0 && fread(pc.r, sizeof(pc_recipe), count, pc.f) != count)
+            rt_fatal("D3D9: the pipeline cache %s cannot be read: %s", pc.path, strerror(errno));
+        if ((size_t)size != whole)
+        {
+            rt_log("D3D9: pipeline cache %s: the last recipe is not complete; it is removed", pc.path);
+            if (ftruncate(fileno(pc.f), (off_t)whole) != 0)
+                rt_fatal("D3D9: the pipeline cache %s cannot be truncated: %s", pc.path, strerror(errno));
+        }
+        pc.n = (uint32_t)count;
+    }
+    for (i = 0; i < pc.n; i++)
+    {
+        const pc_recipe *rc = &pc.r[i];
+        if (rc->decl_n > 64) rt_fatal("D3D9: pipeline cache %s: recipe %zu is not valid", pc.path, i);
+        [pc.known addObject:[NSData dataWithBytes:rc length:sizeof *rc]];
+        pc_index([NSData dataWithBytes:rc->vs_hash length:16], (uint32_t)i);
+        pc_index([NSData dataWithBytes:rc->ps_hash length:16], (uint32_t)i);
+        pc_index(pc_decl_key(rc->decl, rc->decl_n), (uint32_t)i);
+    }
+    pc.total = pc.n;
+    if (fseek(pc.f, 0, SEEK_END) != 0) rt_fatal("D3D9: the pipeline cache %s cannot be read: %s", pc.path, strerror(errno));
+    pc.ready = true;
+    rt_log("D3D9: pipeline cache %s: %u recipes", pc.path, pc.n);
+}
+
+/* The pipeline of the recipe on a pipeline cache thread. */
+static void pc_build(D3DDevice *d, D3DShader *vs, D3DShader *ps, D3DDecl *dc, pipe_key k, NSData *kd)
+{
+    id<MTLRenderPipelineState> p;
+    NSError *err = nil;
+    pc_lock();
+    if (![pc.built[kd] isEqual:PC_QUEUED])
+    {
+        /* The render thread built the pipeline itself. */
+        pc_unlock();
+        return;
+    }
+    pc.built[kd] = PC_BUILDING;
+    pc_unlock();
+    @autoreleasepool
+    {
+        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+        pd.vertexFunction = vs_function(d, vs);
+        pd.fragmentFunction = ps_function(d, ps, vs, (uint16_t)k.depth_compare, k.pcss, k.contact != 0);
+        pd.vertexDescriptor = vertex_desc(d, vs, dc, &k);
+        set_attachments(pd, &k);
+        p = [d->mtl newRenderPipelineStateWithDescriptor:pd error:&err];
+        if (p == nil) rt_fatal("D3D9: render pipeline creation failed: %s", err.localizedDescription.UTF8String);
+    }
+    pc_lock();
+    pc.built[kd] = p;
+    pc.n_built++;
+    if (pthread_cond_broadcast(&pc.done) != 0) rt_fatal("D3D9: pipeline cache signal failed");
+    pc_unlock();
+}
+
+/* Start the builds of the recipes of obj that have all their objects now
+   (pc.lock held). */
+static void pc_start(D3DDevice *d, NSData *obj)
+{
+    int pcss = rt_enh_get(RT_ENH_PCSS), contact = rt_enh_get(RT_ENH_CONTACT);
+    for (NSNumber *num in pc.by_obj[obj])
+    {
+        uint32_t i = num.unsignedIntValue;
+        const pc_recipe *rc = &pc.r[i];
+        D3DShader *vs, *ps;
+        D3DDecl *dc;
+        pipe_key k;
+        NSData *kd;
+        if (pc.started[i]) continue;
+        /* A recipe for different PCSS or contact shadow settings would
+           build a pipeline that no draw uses now. */
+        if ((rc->k.depth_compare != 0 && rc->k.pcss != (uint32_t)pcss) || (rc->k.contact != 0 && contact == 0)) continue;
+        vs = [pc.shaders objectForKey:[NSData dataWithBytes:rc->vs_hash length:16]];
+        ps = [pc.shaders objectForKey:[NSData dataWithBytes:rc->ps_hash length:16]];
+        dc = [pc.decls objectForKey:pc_decl_key(rc->decl, rc->decl_n)];
+        if (vs == nil || ps == nil || dc == nil) continue;
+        pc.started[i] = true;
+        k = rc->k;
+        k.vs = vs->id;
+        k.ps = ps->id;
+        k.decl = dc->id;
+        kd = [NSData dataWithBytes:&k length:sizeof k];
+        if (pc.built[kd] != nil) continue;
+        pc.built[kd] = PC_QUEUED;
+        pc.n_queued++;
+        [pc.q addOperationWithBlock:^{
+            pc_build(d, vs, ps, dc, k, kd);
+        }];
+    }
+}
+
+void d3d_pcache_shader(D3DDevice *d, D3DShader *s)
+{
+    NSData *h = [NSData dataWithBytes:s->hash length:sizeof s->hash];
+    if (!pc.ready) rt_fatal("D3D9: rt_d3d9_pipeline_cache_init was not called");
+    pc_lock();
+    [pc.shaders setObject:s forKey:h];
+    pc_start(d, h);
+    pc_unlock();
+}
+
+void d3d_pcache_decl(D3DDevice *d, D3DDecl *dc)
+{
+    NSData *key = pc_decl_key(dc->el, dc->n);
+    if (!pc.ready) rt_fatal("D3D9: rt_d3d9_pipeline_cache_init was not called");
+    pc_lock();
+    [pc.decls setObject:dc forKey:key];
+    pc_start(d, key);
+    pc_unlock();
+}
+
+/* The pipeline for k that a pipeline cache thread built, or nil. A queued
+   build is taken back (the render thread builds the pipeline at once); a
+   running build is waited for. */
+static id<MTLRenderPipelineState> pcache_take(const pipe_key *k)
+{
+    NSData *kd = [NSData dataWithBytes:k length:sizeof *k];
+    id v;
+    pc_lock();
+    for (;;)
+    {
+        v = pc.built[kd];
+        if (![v isEqual:PC_BUILDING]) break;
+        if (pthread_cond_wait(&pc.done, &pc.lock) != 0) rt_fatal("D3D9: pipeline cache wait failed");
+    }
+    [pc.built removeObjectForKey:kd];
+    if (v == nil)
+    {
+        pc_unlock();
+        return nil;
+    }
+    if ([v isEqual:PC_QUEUED])
+    {
+        pc.n_back++;
+        v = nil;
+    }
+    else
+        pc.n_used++;
+    if ((pc.n_used + pc.n_back) % 64u == 1u)
+        rt_log("D3D9: pipeline cache: %u builds queued, %u built in the background, %u used, %u taken back by the draw",
+               pc.n_queued, pc.n_built, pc.n_used, pc.n_back);
+    pc_unlock();
+    return v;
+}
+
+/* Record the recipe of a pipeline that the render thread built. */
+static void pcache_record(const pipe_key *k, const D3DShader *vs, const D3DShader *ps, const D3DDecl *dc)
+{
+    pc_recipe rc;
+    NSData *rd;
+    memset(&rc, 0, sizeof rc);
+    memcpy(rc.vs_hash, vs->hash, 16);
+    memcpy(rc.ps_hash, ps->hash, 16);
+    rc.decl_n = dc->n;
+    memcpy(rc.decl, dc->el, dc->n * sizeof dc->el[0]);
+    rc.k = *k;
+    rc.k.vs = rc.k.ps = rc.k.decl = 0;
+    rd = [NSData dataWithBytes:&rc length:sizeof rc];
+    pc_lock();
+    if (![pc.known containsObject:rd])
+    {
+        if (pc.total >= PCACHE_MAX)
+        {
+            if (!pc.full_logged) rt_log("D3D9: the pipeline cache has %u recipes; no more are recorded", PCACHE_MAX);
+            pc.full_logged = true;
+        }
+        else
+        {
+            [pc.known addObject:rd];
+            if (fwrite(&rc, sizeof rc, 1, pc.f) != 1 || fflush(pc.f) != 0)
+                rt_fatal("D3D9: the pipeline cache %s cannot be written: %s", pc.path, strerror(errno));
+            pc.total++;
+        }
+    }
+    pc_unlock();
+}
+
 static void check_states(D3DDevice *d, const D3DShader *ps, bool points)
 {
     uint32_t i;
@@ -1551,8 +1870,11 @@ static void bind_constants(D3DDevice *d, const D3DShader *sh, bool ps)
 /* Encode one draw. Returns D3D_OK or an error for invalid calls. */
 static uint32_t do_draw(D3DDevice *d, draw_info *di)
 {
-    D3DShader *vs, *ps;
-    D3DDecl *dc;
+    /* The device state (d->vs, d->ps, d->decl) keeps these objects; only
+       the Set calls change it, and no draw calls them. The locals then do
+       not change the reference counts (a cost of each draw). */
+    __unsafe_unretained D3DShader *vs, *ps;
+    __unsafe_unretained D3DDecl *dc;
     pipe_key k;
     MTLPrimitiveType mt;
     uint32_t n, s, e, i, instances = 1;
@@ -1648,6 +1970,7 @@ static uint32_t do_draw(D3DDevice *d, draw_info *di)
     k.contact = contact != nil;
     {
         id<MTLRenderPipelineState> p = state_cache_get(d->pipelines, &k);
+        if (p == nil && (p = pcache_take(&k)) != nil) state_cache_put(d->pipelines, &k, p);
         if (p == nil)
         {
             pd = [MTLRenderPipelineDescriptor new];
@@ -1655,6 +1978,7 @@ static uint32_t do_draw(D3DDevice *d, draw_info *di)
             pd.fragmentFunction = ps_function(d, ps, vs, dmask, k.pcss, k.contact != 0);
             pd.vertexDescriptor = vertex_desc(d, vs, dc, &k);
             p = make_pipeline(d, &k, pd);
+            pcache_record(&k, vs, ps, dc);
         }
         if (!d->es_valid || d->es_pipe != p)
         {
@@ -2376,6 +2700,47 @@ static void backbuffer_format(D3DDevice *d, D3DSurface *bb)
            want ? "16-bit float (HDR with GT7 tone mapping of the scene)" : "8-bit");
 }
 
+/* Frame pacing with vsync. A frame that takes a little more than one
+   refresh interval is shown for one interval and then for two (judder).
+   The present interval follows the average frame time instead:
+   - Fixed refresh: the smallest whole number of refresh intervals that is
+     not shorter than the average frame time (at most PACE_SLOWEST).
+   - Variable refresh: the average frame time + 5 %, in the refresh range
+     of the screen.
+   The frame time does not include the wait for a drawable, because that
+   wait is the pacing itself. A change to a longer interval is immediate;
+   a change to a shorter interval occurs only when the average frame time
+   is 10 % less than the shorter interval. The result is 0 when the frame
+   is shown at the next refresh (no pacing). */
+#define PACE_SLOWEST 4.0 /* refresh intervals */
+static double pace_interval(D3DDevice *d, uint64_t request)
+{
+    double base = d->refresh_min, work, want, t;
+    bool variable = d->refresh_max - d->refresh_min > 1e-4;
+    if (d->pace_last == 0 || request < d->pace_last) return d->pace_target;
+    work = (double)(request - d->pace_last) * 1e-9;
+    if (work > 0.25) work = 0.25; /* a loading pause */
+    d->pace_avg = d->pace_avg == 0.0 ? work : d->pace_avg * 0.9 + work * 0.1;
+    t = d->pace_target != 0.0 ? d->pace_target : base;
+    if (variable)
+    {
+        want = fmin(fmax(d->pace_avg * 1.05, base), d->refresh_max);
+        if (want > t || want < t * 0.9) t = want;
+    }
+    else
+    {
+        want = base * fmin(fmax(ceil(d->pace_avg / base - 0.02), 1.0), PACE_SLOWEST);
+        if (want > t || (want < t && d->pace_avg < want * 0.9))
+        {
+            if (fabs(want - t) > base * 0.5)
+                rt_log("D3D9: frame pacing: each frame is shown for %.0f refresh intervals (%.1f fps)", want / base, 1.0 / want);
+            t = want;
+        }
+    }
+    d->pace_target = t <= base * 1.001 ? 0.0 : t;
+    return d->pace_target;
+}
+
 void d3d_present(D3DDevice *d)
 {
     @autoreleasepool
@@ -2387,7 +2752,8 @@ void d3d_present(D3DDevice *d)
         float headroom;
         id<CAMetalDrawable> dr;
         uint32_t slot;
-        uint64_t old;
+        uint64_t old, request;
+        double pace = 0.0;
         d3d_end_pass(d);
         if (src.sampleCount > 1)
         {
@@ -2415,7 +2781,10 @@ void d3d_present(D3DDevice *d)
         {
             headroom = d3d_post_hdr_begin(d);
             if (!CGSizeEqualToSize(d->layer.drawableSize, size)) d->layer.drawableSize = size;
+            request = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            pace = d->layer.displaySyncEnabled ? pace_interval(d, request) : 0.0;
             dr = [d->layer nextDrawable];
+            d->pace_last = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         }
         if (dr != nil)
         {
@@ -2483,7 +2852,14 @@ void d3d_present(D3DDevice *d)
             [e setFragmentBytes:&pp_args length:sizeof pp_args atIndex:0];
             [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
             [e endEncoding];
-            [d->cb presentDrawable:dr];
+            if (pace == 0.0)
+                [d->cb presentDrawable:dr];
+            else if (d->refresh_max - d->refresh_min > 1e-4)
+                [d->cb presentDrawable:dr afterMinimumDuration:pace];
+            else
+                /* Half an interval less: the frame then has the refresh at
+                   the paced interval, not the one after it. */
+                [d->cb presentDrawable:dr afterMinimumDuration:pace - d->refresh_min * 0.5];
         }
         else
         {

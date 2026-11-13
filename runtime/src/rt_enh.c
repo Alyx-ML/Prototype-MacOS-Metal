@@ -1,6 +1,7 @@
 /* Mac enhancement settings. See rt_enh.h. */
 #include "rt.h"
 #include "rt_enh.h"
+#include "rt_enh_defs.h"
 #include "rt_file.h"
 
 #include <errno.h>
@@ -8,29 +9,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-typedef struct enh_def {
-    const char *key;
-    int def;
-    int max;
-} enh_def;
-
-static const enh_def defs[RT_ENH_COUNT] = {
-    [RT_ENH_HDR] = {"SettingMacHDR", 0, 1},
-    [RT_ENH_SHADOW_RES] = {"SettingMacShadowResolution", 0, 2},
-    [RT_ENH_METALFX] = {"SettingMacMetalFX", 0, 1},
-    [RT_ENH_SHARPEN] = {"SettingMacSharpening", 0, 3},
-    [RT_ENH_SMAA] = {"SettingMacSMAA", 0, 2},
-    [RT_ENH_BUTTON_ICONS] = {"SettingMacButtonIcons", 1, 1},
-    [RT_ENH_TRIGGERS] = {"SettingMacAdaptiveTriggers", 1, 1},
-    [RT_ENH_RUMBLE] = {"SettingMacRumble", 1, 1},
-    [RT_ENH_FOV] = {"SettingMacFieldOfView", 0, 6},
-    [RT_ENH_AO] = {"SettingMacAmbientOcclusion", 0, 3},
-    [RT_ENH_PCSS] = {"SettingMacSoftShadows", 0, 2},
-    [RT_ENH_TONEMAP] = {"SettingMacToneMapping", 0, 1},
-    [RT_ENH_BLOOM] = {"SettingMacKawaseBloom", 0, 1},
-    [RT_ENH_CONTACT] = {"SettingMacContactShadows", 0, 1},
-};
 
 static _Atomic int values[RT_ENH_COUNT];
 static _Atomic unsigned version;
@@ -51,19 +29,19 @@ int rt_enh_get(rt_enh_id id)
 int rt_enh_default(rt_enh_id id)
 {
     check_id(id);
-    return defs[id].def;
+    return rt_enh_defs[id].def;
 }
 
 int rt_enh_max(rt_enh_id id)
 {
     check_id(id);
-    return defs[id].max;
+    return rt_enh_defs[id].max;
 }
 
 const char *rt_enh_key(rt_enh_id id)
 {
     check_id(id);
-    return defs[id].key;
+    return rt_enh_defs[id].key;
 }
 
 unsigned rt_enh_version(void)
@@ -76,7 +54,7 @@ bool rt_enh_find(const char *db_key, rt_enh_id *out)
     unsigned i;
     if (db_key == NULL) return false;
     for (i = 0; i < RT_ENH_COUNT; i++)
-        if (strcmp(db_key, defs[i].key) == 0) {
+        if (strcmp(db_key, rt_enh_defs[i].key) == 0) {
             *out = (rt_enh_id)i;
             return true;
         }
@@ -93,7 +71,7 @@ static void save(void)
     f = fopen(tmp, "w");
     if (f == NULL) rt_fatal("enhancement settings: %s cannot be written: %s", tmp, strerror(errno));
     for (i = 0; i < RT_ENH_COUNT; i++)
-        if (fprintf(f, "%s %d\n", defs[i].key, rt_enh_get((rt_enh_id)i)) < 0)
+        if (fprintf(f, "%s %d\n", rt_enh_defs[i].key, rt_enh_get((rt_enh_id)i)) < 0)
             rt_fatal("enhancement settings: %s cannot be written: %s", tmp, strerror(errno));
     if (fclose(f) != 0) rt_fatal("enhancement settings: %s cannot be written: %s", tmp, strerror(errno));
     if (rename(tmp, file_path) != 0)
@@ -103,14 +81,14 @@ static void save(void)
 void rt_enh_set(rt_enh_id id, int value)
 {
     check_id(id);
-    if (value < 0 || value > defs[id].max)
-        rt_fatal("enhancement setting %s: the value %d is not in the range 0 to %d", defs[id].key, value, defs[id].max);
-    if (file_path[0] == 0) rt_fatal("enhancement setting %s: rt_enh_init was not called", defs[id].key);
+    if (value < 0 || value > rt_enh_defs[id].max)
+        rt_fatal("enhancement setting %s: the value %d is not in the range 0 to %d", rt_enh_defs[id].key, value, rt_enh_defs[id].max);
+    if (file_path[0] == 0) rt_fatal("enhancement setting %s: rt_enh_init was not called", rt_enh_defs[id].key);
     if (atomic_exchange_explicit(&values[id], value, memory_order_relaxed) == value) return;
     atomic_fetch_add_explicit(&version, 1u, memory_order_release);
     if (id == RT_ENH_FOV) atomic_fetch_add_explicit(&fov_changes, 1u, memory_order_relaxed);
     save();
-    rt_log("enhancement setting %s = %d", defs[id].key, value);
+    rt_log("enhancement setting %s = %d", rt_enh_defs[id].key, value);
 }
 
 void rt_enh_init(const char *path)
@@ -120,7 +98,7 @@ void rt_enh_init(const char *path)
     FILE *f;
     int r = snprintf(file_path, sizeof file_path, "%s", path);
     if (r <= 0 || (size_t)r >= sizeof file_path) rt_fatal("enhancement settings: the path %s is too long", path);
-    for (i = 0; i < RT_ENH_COUNT; i++) atomic_store_explicit(&values[i], defs[i].def, memory_order_relaxed);
+    for (i = 0; i < RT_ENH_COUNT; i++) atomic_store_explicit(&values[i], rt_enh_defs[i].def, memory_order_relaxed);
     f = fopen(path, "r");
     if (f == NULL) {
         if (errno != ENOENT) rt_fatal("enhancement settings: %s cannot be read: %s", path, strerror(errno));
@@ -135,13 +113,11 @@ void rt_enh_init(const char *path)
         n = sscanf(line, "%127s %d %1s", key, &value, extra);
         if (n == EOF) continue;
         if (n != 2) rt_fatal("enhancement settings: %s line %u is not \"<key> <value>\"", path, num);
-        /* A removed setting: anisotropic filtering is now always 16x. The
-           next save writes the file without the line. */
-        if (strcmp(key, "SettingMacAnisotropic") == 0) continue;
+        if (strcmp(key, RT_ENH_REMOVED_KEY) == 0) continue;
         if (!rt_enh_find(key, &id)) rt_fatal("enhancement settings: %s line %u: the key %s is unknown", path, num, key);
-        if (value < 0 || value > defs[id].max)
+        if (value < 0 || value > rt_enh_defs[id].max)
             rt_fatal("enhancement settings: %s line %u: %s %d is not in the range 0 to %d", path, num, key, value,
-                     defs[id].max);
+                     rt_enh_defs[id].max);
         atomic_store_explicit(&values[id], value, memory_order_relaxed);
     }
     if (ferror(f)) rt_fatal("enhancement settings: %s cannot be read: %s", path, strerror(errno));

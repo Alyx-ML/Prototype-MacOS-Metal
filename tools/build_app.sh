@@ -102,10 +102,12 @@ rm -rf "$LOBJ"
 mkdir -p "$LOBJ"
 compile -std=c2x -c "$PORT_DIR/runtime/loader/rt_convert.c" -o "$LOBJ/rt_convert.o"
 compile -fobjc-arc -DRT_LOADER_DEV=1 -c "$PORT_DIR/runtime/loader/rt_loader.m" -o "$LOBJ/rt_loader.o"
-"$LLVM/clang" -target $TRIPLE -fobjc-arc "$LOBJ/rt_loader.o" "$LOBJ/rt_convert.o" \
+compile -fobjc-arc -c "$PORT_DIR/runtime/loader/rt_launcher.m" -o "$LOBJ/rt_launcher.o"
+compile -std=c2x -c "$PORT_DIR/runtime/loader/rt_launcher_art.c" -o "$LOBJ/rt_launcher_art.o"
+"$LLVM/clang" -target $TRIPLE -fobjc-arc "$LOBJ/rt_loader.o" "$LOBJ/rt_launcher.o" "$LOBJ/rt_launcher_art.o" "$LOBJ/rt_convert.o" \
     -framework Cocoa -framework QuartzCore -framework Metal -framework AudioToolbox -framework CoreAudio \
     -framework GameController -framework CoreHaptics -framework Security -framework CoreFoundation \
-    -framework Foundation -framework CoreGraphics -framework MetalFX \
+    -framework Foundation -framework CoreGraphics -framework MetalFX -lz \
     -L"$FFMPEG/lib" -lavcodec -lavutil -Wl,-rpath,"$FFMPEG/lib" \
     -o "$APP/Contents/MacOS/Prototype"
 
@@ -132,6 +134,10 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <string>1</string>
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.action-games</string>
+    <key>LSSupportsGameMode</key>
+    <true/>
+    <key>GCSupportsGameMode</key>
+    <true/>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
     <key>NSHighResolutionCapable</key>

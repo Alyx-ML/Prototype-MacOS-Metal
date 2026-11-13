@@ -89,6 +89,9 @@ static inline double rt_fpu_st(_cpu *cpu, unsigned i)
 /* ---------------------------------------------------------------- memory */
 
 void rt_mem_init(void);
+/* The file of the D3D9 pipeline cache (rt_d3d9_draw.m); before the first
+   CreateDevice. */
+void rt_d3d9_pipeline_cache_init(const char *path);
 /* Address space (Windows VirtualAlloc semantics, 64 KiB granularity). */
 uint32_t rt_va_reserve(uint32_t addr, uint32_t size);           /* returns base or 0 */
 int rt_va_commit(uint32_t addr, uint32_t size);                 /* 0 on success */

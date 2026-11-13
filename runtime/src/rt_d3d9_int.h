@@ -266,8 +266,9 @@ typedef struct d3d_velem {
 @public
     D3DDevice *dev;
     rt_com_object *com;
-    uint32_t id;
-    d3d_shader sh;
+    uint32_t id; /* the same for shaders with the same tokens (d3d_create_shader) */
+    uint8_t hash[16]; /* the first 16 bytes of the SHA-256 of the tokens */
+    d3d_shader sh;    /* freed in dealloc: a background pipeline build can hold the shader */
     id<MTLFunction> vs_func;
     NSMutableDictionary<NSNumber *, id<MTLFunction>> *ps_funcs; /* key: vs id << 19 | contact << 18 | pcss << 16 | depth compare mask */
 }
@@ -320,6 +321,12 @@ typedef struct d3d_stream {
     bool pass_srgb;
     uint64_t present_serial[D3D_FRAMES_IN_FLIGHT];
     uint32_t present_count;
+    /* Frame pacing (d3d_present): the refresh intervals of the screen, the
+       time of the last Present, the average frame time without the waits
+       for a drawable, and the present interval (0: at each refresh). */
+    double refresh_min, refresh_max;
+    uint64_t pace_last;
+    double pace_avg, pace_target;
 
     /* Creation and presentation. */
     uint32_t adapter, devtype, focus_hwnd, behavior;
@@ -403,6 +410,9 @@ typedef struct d3d_stream {
     D3DStateCache *ds_states;
     D3DStateCache *samplers;
     uint32_t next_shader_id, next_decl_id;
+    /* The id of each different shader (key: hash) and vertex declaration
+       (key: the elements), so that equal objects make equal pipeline keys. */
+    NSMutableDictionary<NSData *, NSNumber *> *shader_ids, *decl_ids;
 
     /* Upload memory for draws with user pointers and generated indices. */
     NSMutableArray<D3DRetired *> *upload_free;
@@ -613,6 +623,11 @@ float d3d_post_headroom(D3DDevice *d);
 bool d3d_post_t2x(D3DDevice *d);
 bool d3d_post_t2x_jitter(D3DDevice *d, float j[2]);
 void d3d_post_frame_end(D3DDevice *d);
+/* The pipeline cache (rt_d3d9_draw.m): d3d_create_shader and d3d_create_decl
+   report each new object, and the background pipeline builds of the
+   recorded pipelines that use the object can start. */
+void d3d_pcache_shader(D3DDevice *d, D3DShader *s);
+void d3d_pcache_decl(D3DDevice *d, D3DDecl *dc);
 /* The back buffer in its D3D format for a path that reads it (StretchRect,
    GetRenderTargetData): for an HDR back buffer (D3DSurface.hdr) an 8-bit
    copy of the current contents (values above 1 become 1), else s's

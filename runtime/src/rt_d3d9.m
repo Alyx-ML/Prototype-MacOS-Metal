@@ -21,6 +21,7 @@
 #import <CoreGraphics/CoreGraphics.h>
 
 #include "rt_user32.h"
+#include "rt_window.h"
 
 #include <dispatch/dispatch.h>
 #include <math.h>
@@ -847,6 +848,7 @@ void rt_com_Direct3D9_CreateDevice(_cpu *cpu)
         d->layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
         d->layer.framebufferOnly = YES;
         d->layer.maximumDrawableCount = 3;
+        rt_cocoa_refresh_intervals(&d->refresh_min, &d->refresh_max);
         if (pthread_mutexattr_init(&ma) != 0 || pthread_mutexattr_settype(&ma, PTHREAD_MUTEX_RECURSIVE) != 0 ||
             pthread_mutex_init(&d->lock, &ma) != 0 || pthread_mutexattr_destroy(&ma) != 0 ||
             pthread_mutex_init(&d->done_lock, NULL) != 0 || pthread_cond_init(&d->done_cv, NULL) != 0)

@@ -14,7 +14,7 @@
  * numbered and anonymous namespace scopes, and function scopes (local
  * classes) with their function signature. Other encodings (function
  * pointers, member pointers, arrays, pointer template arguments) give an
- * error; tests/test_rtti.c checks every type name of the game.
+ * error.
  */
 #include "rt_crt.h"
 

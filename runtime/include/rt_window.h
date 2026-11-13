@@ -36,6 +36,10 @@ void rt_cocoa_init(void);
 /* The main screen size in points. */
 void rt_cocoa_screen_size(int32_t *w, int32_t *h);
 
+/* The shortest and the longest refresh interval of the main screen in
+   seconds. The two are equal on a screen without variable refresh. */
+void rt_cocoa_refresh_intervals(double *min, double *max);
+
 /* The outer frame (screen coordinates) for a client rectangle and the
    given window kind. */
 rt_rect rt_cocoa_frame_for_client(rt_rect client, unsigned kind);

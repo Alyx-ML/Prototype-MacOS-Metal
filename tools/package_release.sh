@@ -20,7 +20,6 @@
 #
 # Result:
 #   build/release/dist/Prototype.app
-#   build/release/dist/Put game files here/
 #   build/release/dist/README.txt
 #   build/release/Prototype-Mac-ARM64.zip
 #
@@ -72,7 +71,7 @@ done
 
 rm -rf "$OUT"
 mkdir -p "$OBJ" "$APP/Contents/MacOS" "$REC/bin" "$REC/lib" "$REC/include/llasm-support" "$REC/include/runtime" \
-    "$REC/modules" "$FRAMEWORKS" "$APP/Contents/Resources/Licenses" "$DIST/Put game files here"
+    "$REC/modules" "$FRAMEWORKS" "$APP/Contents/Resources/Licenses"
 
 # Compile one file. The port directory can contain spaces, so the paths
 # are separate quoted arguments. -ffile-prefix-map removes the build
@@ -104,6 +103,8 @@ done
 echo "PROGRESS build the loader"
 compile -std=c2x -c "$PORT_DIR/runtime/loader/rt_convert.c" -o "$OBJ/loader_rt_convert.o"
 compile -fobjc-arc -DRT_LOADER_DEV=0 -c "$PORT_DIR/runtime/loader/rt_loader.m" -o "$OBJ/loader_rt_loader.o"
+compile -fobjc-arc -c "$PORT_DIR/runtime/loader/rt_launcher.m" -o "$OBJ/loader_rt_launcher.o"
+compile -std=c2x -c "$PORT_DIR/runtime/loader/rt_launcher_art.c" -o "$OBJ/loader_rt_launcher_art.o"
 for lib in libavcodec libavutil; do
     cp -L "$FFMPEG_PREFIX/lib/$lib.dylib" "$FRAMEWORKS/$lib.dylib"
 done
@@ -152,10 +153,10 @@ for lib in libavcodec libavutil; do
     install_name_tool -id "@rpath/$lib.dylib" "$FRAMEWORKS/$lib.dylib"
     copy_deps "$FRAMEWORKS/$lib.dylib" "$FRAMEWORKS"
 done
-"$LLVM/clang" -target $TRIPLE -fobjc-arc "$OBJ/loader_rt_loader.o" "$OBJ/loader_rt_convert.o" \
+"$LLVM/clang" -target $TRIPLE -fobjc-arc "$OBJ/loader_rt_loader.o" "$OBJ/loader_rt_launcher.o" "$OBJ/loader_rt_launcher_art.o" "$OBJ/loader_rt_convert.o" \
     -framework Cocoa -framework QuartzCore -framework Metal -framework AudioToolbox -framework CoreAudio \
     -framework GameController -framework CoreHaptics -framework Security -framework CoreFoundation \
-    -framework Foundation -framework CoreGraphics -framework MetalFX \
+    -framework Foundation -framework CoreGraphics -framework MetalFX -lz \
     "$FRAMEWORKS/libavcodec.dylib" "$FRAMEWORKS/libavutil.dylib" -Wl,-rpath,@executable_path/../Frameworks \
     -o "$APP/Contents/MacOS/Prototype"
 
@@ -178,6 +179,7 @@ done
 CLANG_RT="$("$LLVM/clang" -target $TRIPLE -print-file-name=lib/darwin/libclang_rt.osx.a)"
 [ -f "$CLANG_RT" ] || die "libclang_rt.osx.a was not found"
 cp "$CLANG_RT" "$REC/lib/libclang_rt.osx.a"
+chmod u+w "$REC/lib/libclang_rt.osx.a"
 cp "$PORT_DIR"/third_party/SR/SR/llasm-support/*.llinc "$REC/include/llasm-support/"
 # The SSE helpers as bitcode: the converter links them into the engine
 # parts so that clang can inline them (see tools/build_sse_inline.sh).
@@ -262,6 +264,10 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <string>1</string>
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.action-games</string>
+    <key>LSSupportsGameMode</key>
+    <true/>
+    <key>GCSupportsGameMode</key>
+    <true/>
     <key>LSMinimumSystemVersion</key>
     <string>$MIN_VERSION</string>
     <key>NSHighResolutionCapable</key>
@@ -289,20 +295,25 @@ paths="$(grep -r -l -a "/Users/" "$DIST" | head -5 || true)"
 cat > "$DIST/README.txt" <<'README'
 Prototype for Mac (Apple silicon)
 
-1. Copy the installed Steam version of Prototype into the folder
-   "Put game files here". The folder must hold prototypef.exe and
-   prototypeenginef.dll.
-2. Open Prototype.app.
-3. On the first start, the application prepares the game for this Mac.
+You need the installed Steam version of Prototype on this Mac. The game
+folder must hold prototypef.exe and prototypeenginef.dll.
+
+1. Open Prototype.app. The Prototype window opens.
+2. Click "Choose Folder..." and select the installed game folder. The
+   window shows a green mark when the folder can be used.
+3. Change the settings for graphics and controllers if necessary.
+4. Click Play.
+5. On the first start, the application prepares the game for this Mac.
    This is done one time. It can take several minutes and needs 8 GB of
    free disk space for temporary files.
-4. The game starts. Later starts do not prepare the game again.
+6. The game starts. Later starts do not prepare the game again.
 
 The application has an ad hoc signature. If macOS does not open it, open
 System Settings > Privacy & Security and click "Open Anyway".
 
-Hold the Option key when the application starts to select a different
-game folder.
+The window opens each time that the application starts. It shows the
+folder that you selected before. Changes to the settings apply when you
+click Play. To quit without playing, close the window.
 README
 
 rm -f "$OUT/Prototype-Mac-ARM64.zip"

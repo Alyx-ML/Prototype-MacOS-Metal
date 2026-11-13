@@ -20,6 +20,8 @@
 #import "rt_d3d9_int.h"
 #include "rt_enh.h"
 
+#include <CommonCrypto/CommonDigest.h>
+
 #include <stdatomic.h>
 
 #include <stdlib.h>
@@ -185,6 +187,10 @@ D3DRetired *d3d_retired_new(id<MTLBuffer> b, id<MTLTexture> t, uint64_t serial)
 @implementation D3DDecl
 @end
 @implementation D3DShader
+- (void)dealloc
+{
+    d3d_shader_free(&sh);
+}
 @end
 @implementation D3DQuery
 @end
@@ -1583,9 +1589,22 @@ uint32_t d3d_create_decl(D3DDevice *d, const d3d_velem *el, uint32_t n, uint32_t
     dc->dev = d;
     dc->n = n;
     dc->fvf = fvf;
-    dc->id = ++d->next_decl_id;
+    {
+        NSData *key = [NSData dataWithBytes:dc->el length:n * sizeof dc->el[0]];
+        NSNumber *idn;
+        if (d->decl_ids == nil) d->decl_ids = [NSMutableDictionary new];
+        idn = d->decl_ids[key];
+        if (idn == nil)
+        {
+            if (d->next_decl_id == UINT32_MAX) rt_fatal("D3D9: too many different vertex declarations");
+            idn = @(++d->next_decl_id);
+            d->decl_ids[key] = idn;
+        }
+        dc->id = idn.unsignedIntValue;
+    }
     *out_obj = make_object(&d3d_decl_class, dc);
     dc->com = *out_obj;
+    d3d_pcache_decl(d, dc);
     return D3D_OK;
 }
 
@@ -1660,19 +1679,35 @@ uint32_t d3d_create_shader(D3DDevice *d, bool ps, uint32_t function, uint32_t ou
         rt_fatal("D3D9: %s shader is not supported: %s", ps ? "pixel" : "vertex", err);
     if (s->sh.is_ps != ps) rt_fatal("D3D9: Create%sShader with a %s shader", ps ? "Pixel" : "Vertex", s->sh.is_ps ? "pixel" : "vertex");
     s->dev = d;
-    s->id = ++d->next_shader_id;
-    if (s->id > 0xFFFFu) rt_fatal("D3D9: more than 65535 shaders");
+    {
+        uint8_t full[CC_SHA256_DIGEST_LENGTH];
+        NSData *h;
+        NSNumber *idn;
+        CC_SHA256(s->sh.tokens, (CC_LONG)(s->sh.ntokens * 4u), full);
+        memcpy(s->hash, full, sizeof s->hash);
+        h = [NSData dataWithBytes:s->hash length:sizeof s->hash];
+        if (d->shader_ids == nil) d->shader_ids = [NSMutableDictionary new];
+        idn = d->shader_ids[h];
+        if (idn == nil)
+        {
+            if (d->next_shader_id >= 0xFFFFu) rt_fatal("D3D9: more than 65535 different shaders");
+            idn = @(++d->next_shader_id);
+            d->shader_ids[h] = idn;
+        }
+        s->id = idn.unsignedIntValue;
+    }
     s->ps_funcs = [NSMutableDictionary new];
     o = make_object(ps ? &d3d_ps_class : &d3d_vs_class, s);
     s->com = o;
     write_iface(o, out);
+    d3d_pcache_shader(d, s);
     return D3D_OK;
 }
 
 static void shader_destroy(rt_com_object *o)
 {
     D3DShader *s = (__bridge_transfer D3DShader *)o->data;
-    d3d_shader_free(&s->sh);
+    (void)s; /* the last reference frees the tokens (dealloc) */
 }
 
 static rt_com_object *shader_obj(uint32_t p)

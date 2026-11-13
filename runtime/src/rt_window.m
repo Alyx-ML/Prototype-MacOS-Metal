@@ -8,7 +8,9 @@
  * The guest message loop calls rt_cocoa_pump (from PeekMessageA). The pump
  * takes every waiting NSEvent and gives it to NSApp; the view and the
  * window delegate then report keys, mouse input, activation, moves,
- * resizes and close requests to USER32.
+ * resizes and close requests to USER32. The game calls PeekMessageA many
+ * times in each frame, and each AppKit event query is expensive, so the
+ * pump queries AppKit at most once in each PUMP_INTERVAL_NS.
  */
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/CAMetalLayer.h>
@@ -17,6 +19,7 @@
 #include "rt_dinput.h"
 #include "rt_window.h"
 
+#include <mach/mach_time.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -494,6 +497,18 @@ void rt_cocoa_screen_size(int32_t *w, int32_t *h)
     *h = to_i32(s.frame.size.height);
 }
 
+void rt_cocoa_refresh_intervals(double *min, double *max)
+{
+    NSScreen *s;
+    need_main(__func__);
+    s = NSScreen.screens.firstObject;
+    if (s == nil) rt_fatal("no display is available");
+    *min = s.minimumRefreshInterval;
+    *max = s.maximumRefreshInterval;
+    if (!(*min > 0.0) || !(*max >= *min))
+        rt_fatal("the main screen has refresh intervals that are not valid (%f, %f)", *min, *max);
+}
+
 rt_rect rt_cocoa_frame_for_client(rt_rect client, unsigned kind)
 {
     need_main(__func__);
@@ -602,9 +617,23 @@ void *rt_cocoa_window_layer(void *w)
     return (__bridge void *)l;
 }
 
+#define PUMP_INTERVAL_NS 1000000ull /* 1 ms: less than a quarter of a frame at 240 Hz */
+
 void rt_cocoa_pump(void)
 {
+    static uint64_t last, interval;
+    uint64_t now = mach_absolute_time();
     need_main(__func__);
+    if (interval == 0)
+    {
+        mach_timebase_info_data_t tb;
+        if (mach_timebase_info(&tb) != KERN_SUCCESS || tb.numer == 0 || tb.denom == 0)
+            rt_fatal("mach_timebase_info failed");
+        interval = PUMP_INTERVAL_NS * tb.denom / tb.numer;
+        if (interval == 0) interval = 1;
+    }
+    if (last != 0 && now - last < interval) return;
+    last = now;
     @autoreleasepool
     {
         for (;;)

@@ -20,8 +20,7 @@
 #         no translated code calls this import: only code bytes that no
 #         code or data refers to (dead code that SRW does not translate)
 #         call it. tools/gen_thunks.py writes the C function; a call stops
-#         the process with a message. tools/check_unreachable.py checks
-#         that no translated code refers to the import.
+#         the process with a message.
 # c-name: optional; the default is the import name (encoded).
 
 # ---------------------------------------------------------------- KERNEL32
