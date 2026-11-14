@@ -23,8 +23,9 @@
  *      translation inputs) and of the libraries in Contents/Frameworks (the
  *      bundle uses their symbols). A release that changes one of them makes
  *      a new bundle; a release that changes only this executable (for
- *      example the launcher window) keeps the bundle. The loader removes
- *      the bundles with a different <id>.
+ *      example the launcher window) keeps the bundle. Of the bundles with
+ *      a different <id>, the loader keeps the one that was used last and
+ *      removes the others.
  * 4. Open the bundle with dlopen and call rt_game_main on the main thread.
  *
  * The libraries and frameworks that the runtime uses are linked to this
@@ -51,6 +52,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/xattr.h>
 
 #ifndef RT_LOADER_DEV
@@ -423,15 +425,39 @@ static void sha256_text(const char *text, char out[65])
     out[64] = 0;
 }
 
-/* Remove each entry of the GameCode directory except keep. */
+/* Clean the GameCode directory. Keep the entry keep and the complete copy
+   of the game code that was used last of the other entries (the marker
+   "complete" gets the time of each use), so that a player who uses two
+   versions of the application does not convert the game at each change.
+   Remove all other entries. */
 static void remove_other_caches(const char *base, const char *keep)
 {
-    NSArray<NSString *> *names = [NSFileManager.defaultManager contentsOfDirectoryAtPath:str(base) error:nil];
+    NSError *e = nil;
+    NSArray<NSString *> *names = [NSFileManager.defaultManager contentsOfDirectoryAtPath:str(base) error:&e];
+    NSString *newest = nil;
+    struct timespec newest_time = { 0, 0 };
+    if (names == nil)
+        fail(@"The folder of the game code cannot be read.", [NSString stringWithFormat:@"%s: %@", base, e.localizedDescription]);
+    for (NSString *n in names)
+    {
+        char p[PATH_LEN], m[PATH_LEN];
+        struct stat st;
+        if ([n isEqualToString:str(keep)]) continue;
+        if (!join(p, sizeof p, base, n.fileSystemRepresentation) || !join(m, sizeof m, p, "complete"))
+            fail(@"The home folder path is too long.", str(base));
+        if (!is_dir(p) || stat(m, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        if (newest == nil || st.st_mtimespec.tv_sec > newest_time.tv_sec ||
+            (st.st_mtimespec.tv_sec == newest_time.tv_sec && st.st_mtimespec.tv_nsec > newest_time.tv_nsec))
+        {
+            newest = n;
+            newest_time = st.st_mtimespec;
+        }
+    }
     for (NSString *n in names)
     {
         char p[PATH_LEN], err[PATH_LEN + 64];
-        if ([n isEqualToString:str(keep)]) continue;
-        if (!join(p, sizeof p, base, n.fileSystemRepresentation)) continue;
+        if ([n isEqualToString:str(keep)] || (newest != nil && [n isEqualToString:newest])) continue;
+        if (!join(p, sizeof p, base, n.fileSystemRepresentation)) fail(@"The home folder path is too long.", str(base));
         if (!remove_tree(p, err, sizeof err)) fail(@"An old copy of the game code cannot be removed.", str(err));
     }
 }
@@ -519,7 +545,13 @@ static void get_bundle(const char *game_dir, char *bundle, size_t n)
         fail(@"The home folder path is too long.", str(home));
     mkdir_p(base);
     remove_other_caches(base, id);
-    if (is_file(marker) && is_file(bundle)) return;
+    if (is_file(marker) && is_file(bundle))
+    {
+        /* The time of this use (see remove_other_caches). */
+        if (utimes(marker, NULL) != 0)
+            fail(@"The converted game code cannot be recorded.", [NSString stringWithFormat:@"%s: %s", marker, strerror(errno)]);
+        return;
+    }
 
     /* A conversion that did not complete leaves files; start again. */
     if (!remove_tree(dir, err, sizeof err)) fail(@"An old copy of the game code cannot be removed.", str(err));

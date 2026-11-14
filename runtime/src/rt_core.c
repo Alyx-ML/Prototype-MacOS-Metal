@@ -4,10 +4,12 @@
  */
 #include "rt_thread.h"
 
+#include <CoreFoundation/CoreFoundation.h>
 #include <errno.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 extern void c_rt_call_c2asm(_cpu *cpu);
@@ -18,30 +20,113 @@ static atomic_uint next_tid = 0x100;
 
 /* ---------------------------------------------------------------- messages */
 
-static void vlog(const char *prefix, const char *fmt, va_list ap)
+static FILE *log_file;
+static char log_path[1024];
+
+/* A message line to the standard error and to the log file (log_lock). */
+static void put_line(const char *prefix, const char *msg)
 {
+    int e = 0;
     pthread_mutex_lock(&log_lock);
-    fputs(prefix, stderr);
-    vfprintf(stderr, fmt, ap);
-    fputc('\n', stderr);
+    fprintf(stderr, "%s%s\n", prefix, msg);
     fflush(stderr);
+    if (log_file != NULL && (fprintf(log_file, "%s%s\n", prefix, msg) < 0 || fflush(log_file) != 0))
+    {
+        /* The log cannot be written (for example the disk is full). The
+           log is closed first, so that the fatal error below writes only
+           to the standard error and to the alert. */
+        e = errno != 0 ? errno : EIO;
+        fclose(log_file);
+        log_file = NULL;
+    }
     pthread_mutex_unlock(&log_lock);
+    if (e != 0) rt_fatal("the log file %s cannot be written: %s", log_path, strerror(e));
+}
+
+/* Format a message. A message that does not fit ends with "[cut]". */
+static void format_msg(char *msg, size_t n, const char *fmt, va_list ap)
+{
+    static const char cut[] = " [cut]";
+    int r = vsnprintf(msg, n, fmt, ap);
+    if (r < 0) snprintf(msg, n, "(the message cannot be formatted: %s)", fmt);
+    else if ((size_t)r >= n) memcpy(msg + n - sizeof cut, cut, sizeof cut);
+}
+
+void rt_log_open(const char *path, const char *previous)
+{
+    int r = snprintf(log_path, sizeof log_path, "%s", path);
+    if (r <= 0 || (size_t)r >= sizeof log_path) rt_fatal("the log file path %s is too long", path);
+    if (rename(path, previous) != 0 && errno != ENOENT)
+        rt_fatal("the log file %s cannot be renamed to %s: %s", path, previous, strerror(errno));
+    pthread_mutex_lock(&log_lock);
+    log_file = fopen(path, "w");
+    pthread_mutex_unlock(&log_lock);
+    if (log_file == NULL) rt_fatal("the log file %s cannot be made: %s", path, strerror(errno));
 }
 
 void rt_log(const char *fmt, ...)
 {
+    char msg[4096];
     va_list ap;
     va_start(ap, fmt);
-    vlog("[rt] ", fmt, ap);
+    format_msg(msg, sizeof msg, fmt, ap);
     va_end(ap);
+    put_line("[rt] ", msg);
+}
+
+/* A CFString of UTF-8 text. Text that is not UTF-8 is read as Latin-1,
+   which accepts all byte values, so the alert always has the message. */
+static CFStringRef cf_text(const char *s)
+{
+    CFStringRef r = CFStringCreateWithCString(kCFAllocatorDefault, s, kCFStringEncodingUTF8);
+    if (r == NULL) r = CFStringCreateWithCString(kCFAllocatorDefault, s, kCFStringEncodingISOLatin1);
+    return r;
+}
+
+/* The alert of a fatal error. CFUserNotification shows it from any thread
+   and does not need the main run loop, so the alert also works when the
+   main thread waits for this thread. */
+static void fatal_alert(const char *msg)
+{
+    char text[sizeof log_path + 4096 + 128];
+    CFStringRef header, body;
+    CFOptionFlags response;
+#if RT_DEV_BUILD
+    const char *h = getenv("RT_HEADLESS");
+    if (h != NULL && strcmp(h, "1") == 0) return; /* test runs have no alert */
+#endif
+    if (log_path[0] != 0)
+        snprintf(text, sizeof text, "%s\n\nThe log file has the details:\n%s", msg, log_path);
+    else
+        snprintf(text, sizeof text, "%s", msg);
+    header = CFSTR("Prototype stopped because of an error.");
+    body = cf_text(text);
+    if (body == NULL)
+    {
+        fprintf(stderr, "[rt] the alert of the error cannot be made\n");
+        return;
+    }
+    if (CFUserNotificationDisplayAlert(0, kCFUserNotificationStopAlertLevel, NULL, NULL, NULL, header, body,
+                                       CFSTR("Quit"), NULL, NULL, &response) != 0)
+        fprintf(stderr, "[rt] the alert of the error cannot be shown\n");
+    CFRelease(body);
 }
 
 _Noreturn void rt_fatal(const char *fmt, ...)
 {
+    static atomic_flag reported = ATOMIC_FLAG_INIT;
+    char msg[4096];
     va_list ap;
     va_start(ap, fmt);
-    vlog("[rt] fatal: ", fmt, ap);
+    format_msg(msg, sizeof msg, fmt, ap);
     va_end(ap);
+    put_line("[rt] fatal: ", msg);
+    /* Only the first fatal error shows an alert. A second thread with a
+       fatal error waits, so that the process does not stop before the
+       player reads the first message. */
+    if (atomic_flag_test_and_set(&reported))
+        for (;;) pause();
+    fatal_alert(msg);
     abort();
 }
 

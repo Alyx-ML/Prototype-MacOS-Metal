@@ -12,6 +12,8 @@
  *   registry.txt  the emulated registry
  *   enhancements.txt  the Mac enhancement settings (rt_enh.h)
  *   pipelines.cache   the recorded Metal pipelines (rt_d3d9_draw.m)
+ *   Prototype.log     the messages of the runtime of this start; the log of
+ *                     the start before is Prototype.previous.log
  *
  * The guest runs on the main thread, because the window system works only
  * on the main thread. The guest message loop handles the native events
@@ -27,9 +29,12 @@
 #include "rt_thread.h"
 #include "rt_user32.h"
 
+#include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
 
 #define PORT_NAME "Prototype Mac Port"
 
@@ -44,7 +49,7 @@ static bool join_path(char *out, size_t n, const char *dir, const char *name)
 _Noreturn void rt_game_main(const char *game_dir)
 {
     char base[RT_HOST_PATH], user[RT_HOST_PATH], data[RT_HOST_PATH], reg[RT_HOST_PATH], enh[RT_HOST_PATH];
-    char pcache[RT_HOST_PATH];
+    char pcache[RT_HOST_PATH], log_now[RT_HOST_PATH], log_prev[RT_HOST_PATH];
     const char *home = getenv("HOME");
     rt_thread *t;
     uint32_t code;
@@ -57,8 +62,12 @@ _Noreturn void rt_game_main(const char *game_dir)
     if (!join_path(base, sizeof base, home, "Library/Application Support/" PORT_NAME) ||
         !join_path(user, sizeof user, base, "User") || !join_path(data, sizeof data, base, "ProgramData") ||
         !join_path(reg, sizeof reg, base, "registry.txt") || !join_path(enh, sizeof enh, base, "enhancements.txt") ||
-        !join_path(pcache, sizeof pcache, base, "pipelines.cache"))
+        !join_path(pcache, sizeof pcache, base, "pipelines.cache") ||
+        !join_path(log_now, sizeof log_now, base, "Prototype.log") ||
+        !join_path(log_prev, sizeof log_prev, base, "Prototype.previous.log"))
         rt_fatal("the home directory path is too long");
+    if (mkdir(base, 0755) != 0 && errno != EEXIST) rt_fatal("the folder %s cannot be made: %s", base, strerror(errno));
+    rt_log_open(log_now, log_prev);
     rt_log("game directory %s", game_dir);
 
     rt_mem_init();

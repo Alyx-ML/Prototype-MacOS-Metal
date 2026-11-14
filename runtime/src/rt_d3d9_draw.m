@@ -2579,6 +2579,7 @@ void rt_com_D3DDevice9_ColorFill(_cpu *cpu)
 
 /* ---------------------------------------------------------------- present */
 
+#if RT_DEV_BUILD
 /* Frame statistics: with the environment variable RT_PERF_LOG=1, the
    runtime logs the frame rate, the longest frame time and the process
    CPU time every 5 seconds of presented frames. */
@@ -2620,6 +2621,7 @@ static void perf_frame(void)
         worst = 0.0;
     }
 }
+#endif
 
 /* Draw all of src into dst (same size; a format conversion). */
 static void copy_draw(D3DDevice *d, id<MTLTexture> src, id<MTLTexture> dst, const char *what)
@@ -2878,7 +2880,9 @@ void d3d_present(D3DDevice *d)
         d->present_count++;
         d3d_flush(d);
         if (old != 0) d3d_wait_serial(d, old);
+#if RT_DEV_BUILD
         perf_frame();
+#endif
     }
 }
 

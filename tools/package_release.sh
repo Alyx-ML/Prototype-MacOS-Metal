@@ -10,7 +10,8 @@
 #   1. tools/translate_launcher.sh and tools/translate_engine.sh completed.
 #      The SRW output files in work/launcher and work/engine are the tested
 #      translation; their SHA-256 values go into the manifest.
-#   2. build/srw/SRW and build/llasm/llasm exist.
+#   2. build/srw/SRW and build/llasm/llasm exist (tools/build_toolchain.sh,
+#      built for macOS 27.2).
 #   3. LLVM and lld from Homebrew (/opt/homebrew/opt/llvm, /opt/homebrew/opt/lld).
 #   4. FFMPEG_PREFIX names an FFmpeg build with the LGPL license (configured
 #      without --enable-gpl and without --enable-nonfree) that holds
@@ -28,7 +29,9 @@
 #   - the application holds a file with game code (.o, .ll, .llasm, .bc
 #     other than the SSE helper bitcode, .exe, .dll) or a symbol of the
 #     translated code,
-#   - a file holds a path of the build computer (/Users/).
+#   - a file holds a path of the build computer (its home folder or the
+#     port folder),
+#   - a program or library needs a macOS version newer than MIN_VERSION.
 set -eu
 
 PORT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -234,12 +237,20 @@ for f in "$REC"/lib/*.dylib "$FRAMEWORKS"/*.dylib; do
     esac
 done
 
-# The minimum macOS version is the highest minimum version of the files.
-MIN_VERSION="$(for f in "$APP/Contents/MacOS/Prototype" "$REC"/bin/* "$REC"/lib/*.dylib "$FRAMEWORKS"/*.dylib; do
-    otool -l "$f" | awk '/cmd LC_BUILD_VERSION/{b=1} b&&/minos/{print $2; b=0}'
-done | awk -F. 'BEGIN{best="14.0"; split(best, B, ".")}
-    { if ($1+0 > B[1]+0 || ($1+0 == B[1]+0 && $2+0 > B[2]+0)) { best=$0; split(best, B, ".") } }
-    END{print best}')"
+# The minimum macOS version of the application. The converter tools of
+# Homebrew (LLVM, lld) need macOS 27.2; tools/build_toolchain.sh builds SRW
+# and llasm for the same version. Each program and library must run on
+# this version: a file that needs a newer version stops the script, so
+# that a build on a beta of macOS cannot make a release that only the beta
+# can open.
+MIN_VERSION=27.2
+TOO_NEW="$(for f in "$APP/Contents/MacOS/Prototype" "$REC"/bin/* "$REC"/lib/*.dylib "$FRAMEWORKS"/*.dylib; do
+    v="$(otool -l "$f" | awk '/cmd LC_BUILD_VERSION/{b=1} b&&/minos/{print $2; exit}')"
+    [ -n "$v" ] || { echo "$(basename "$f") (no minimum version)"; continue; }
+    echo "$v" | awk -F. -v min="$MIN_VERSION" -v name="$(basename "$f")" \
+        'BEGIN{split(min, M, ".")} { if ($1+0 > M[1]+0 || ($1+0 == M[1]+0 && $2+0 > M[2]+0)) print name " (" $0 ")" }'
+done)"
+[ -z "$TOO_NEW" ] || die "these files need a macOS version newer than $MIN_VERSION: $(echo $TOO_NEW)"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -289,11 +300,16 @@ if "$LLVM/llvm-nm" --defined-only "$APP/Contents/MacOS/Prototype" "$REC/lib/libp
     grep -E ' (_X_|_loc_[0-9A-F]|_engine_image|_launcher_image)' | grep -q -v -E ' _X_[A-Za-z0-9_]*_asm2c$'; then
     die "the package defines a symbol of the translated code"
 fi
-paths="$(grep -r -l -a "/Users/" "$DIST" | head -5 || true)"
+# The home folder and the port folder of the build computer. Paths of other
+# computers (for example /Users/runner/... of the LDC runtime build) do not
+# tell anything about the build computer.
+paths="$(grep -r -l -a -F -e "$HOME/" -e "$PORT_DIR" "$DIST" | head -5 || true)"
 [ -z "$paths" ] || die "files hold paths of the build computer: $paths"
 
 cat > "$DIST/README.txt" <<'README'
 Prototype for Mac (Apple silicon)
+
+You need a Mac with Apple silicon and macOS 27.2 or later.
 
 You need the installed Steam version of Prototype on this Mac. The game
 folder must hold prototypef.exe and prototypeenginef.dll.
@@ -314,8 +330,14 @@ System Settings > Privacy & Security and click "Open Anyway".
 The window opens each time that the application starts. It shows the
 folder that you selected before. Changes to the settings apply when you
 click Play. To quit without playing, close the window.
+
+The log files Prototype.log and Prototype.previous.log are in
+~/Library/Application Support/Prototype Mac Port/. If the game stops
+because of an error, an alert shows the error, and the log has the details.
 README
 
 rm -f "$OUT/Prototype-Mac-ARM64.zip"
-(cd "$DIST" && ditto -c -k --sequesterRsrc . "$OUT/Prototype-Mac-ARM64.zip")
+# --norsrc: no resource forks, extended attributes or ACLs, so the archive
+# has no __MACOSX folder. The signatures are in the files themselves.
+(cd "$DIST" && ditto -c -k --norsrc . "$OUT/Prototype-Mac-ARM64.zip")
 echo "PROGRESS done: $OUT/Prototype-Mac-ARM64.zip (minimum macOS $MIN_VERSION)"

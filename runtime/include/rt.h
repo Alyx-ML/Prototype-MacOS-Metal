@@ -21,10 +21,21 @@
 
 extern uint64_t rt_ptrofs;
 
-/* Print a message and stop the process. Used for every condition that the
-   runtime does not support; there is no fallback behavior. */
+/* RT_DEV_BUILD is 1 only in the development app (tools/build_app.sh). The
+   development app reads the test settings RT_HEADLESS, RT_INPUT_SCRIPT and
+   RT_PERF_LOG. The release runtime does not have them. */
+#ifndef RT_DEV_BUILD
+#define RT_DEV_BUILD 0
+#endif
+
+/* Write a message to the log, show an alert with the message and stop the
+   process. Used for every condition that the runtime does not support;
+   there is no fallback behavior. */
 _Noreturn void rt_fatal(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+/* Write a message to the standard error and to the log file. */
 void rt_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+/* Open the log file at path. An old log at path becomes previous. */
+void rt_log_open(const char *path, const char *previous);
 
 /* Guest address to host pointer. Guest address 0 gives NULL. */
 static inline void *G2H(uint32_t g)

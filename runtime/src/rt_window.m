@@ -257,7 +257,13 @@ static RTAppTarget *app_target;
 
 /* ---------------------------------------------------------------- headless mode */
 
+/* RT_HEADLESS=1 and RT_INPUT_SCRIPT are test settings of the development
+   app (RT_DEV_BUILD). In the release runtime, headless is always false. */
+#if RT_DEV_BUILD
 static bool headless;
+#else
+static const bool headless = false;
+#endif
 static uint32_t headless_hwnd; /* the guest window reported as active */
 
 bool rt_cocoa_headless(void)
@@ -280,6 +286,7 @@ static void headless_activate(uint32_t hwnd)
     dispatch_async_f(dispatch_get_main_queue(), (void *)(uintptr_t)hwnd, headless_activate_cb);
 }
 
+#if RT_DEV_BUILD
 /* RT_INPUT_SCRIPT: comma-separated steps, times in seconds from the start
    of the process.
      T:key          press and release key at T
@@ -446,6 +453,7 @@ static void script_start_timer(void)
     dispatch_source_set_event_handler_f(script_timer, script_tick);
     dispatch_resume(script_timer);
 }
+#endif
 
 void rt_cocoa_init(void)
 {
@@ -455,10 +463,12 @@ void rt_cocoa_init(void)
     need_main(__func__);
     if (app_target != nil) return;
     [NSApplication sharedApplication];
+#if RT_DEV_BUILD
     {
         const char *h = getenv("RT_HEADLESS");
         headless = h != NULL && strcmp(h, "1") == 0;
     }
+#endif
     if (headless)
     {
         /* No Dock icon, no menu bar, never the active application. */
@@ -484,7 +494,9 @@ void rt_cocoa_init(void)
     item.submenu = menu;
     NSApp.mainMenu = bar;
     [NSApp finishLaunching];
+#if RT_DEV_BUILD
     script_start_timer();
+#endif
 }
 
 void rt_cocoa_screen_size(int32_t *w, int32_t *h)

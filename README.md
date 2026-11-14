@@ -9,7 +9,7 @@ the game from Steam.
 
 ## Requirements
 
-- A Mac with Apple silicon.
+- A Mac with Apple silicon and macOS 27.2 or later.
 - The installed game folder of the Steam version of Prototype, copied to
   your Mac.
 - 8 GB of free disk space for the first start.
@@ -74,14 +74,24 @@ Your settings, saved games and the prepared game code are in
 `~/Library/Application Support/Prototype Mac Port/`. Your game folder is not
 changed.
 
+The same folder holds the log of the last game start, `Prototype.log`, and
+the log of the start before it, `Prototype.previous.log`. If the game stops
+because of an error, an alert shows the error, and the log has the details.
+
 ## Build from source
 
 This is only necessary if you want to make the release package yourself.
 
-You need Xcode or the Xcode Command Line Tools, the Homebrew packages `llvm`,
-`lld` and `ldc` (`brew install llvm lld ldc`), Python 3, an FFmpeg source
-archive from <https://ffmpeg.org/download.html>, and the two supported game
-files.
+You need Xcode or the Xcode Command Line Tools, the Homebrew packages `llvm`
+and `lld` (`brew install llvm lld`), LDC (the LLVM D compiler), Python 3, an
+FFmpeg source archive from <https://ffmpeg.org/download.html>, and the two
+supported game files.
+
+Use the `osx-arm64` archive of LDC from
+<https://github.com/ldc-developers/ldc/releases>, and put its `bin` folder in
+your `PATH`. The release package must operate on macOS 27.2.
+`tools/package_release.sh` stops if a file of the package needs a newer
+macOS version.
 
 1. Build the recompiler tools:
 

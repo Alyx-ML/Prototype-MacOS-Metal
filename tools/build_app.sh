@@ -43,10 +43,12 @@ OBJ="$PORT_DIR/build/app/obj"
 APP="$PORT_DIR/build/app/Prototype.app"
 
 # Compile one file. The port directory can contain spaces, so the include
-# paths are separate quoted arguments.
+# paths are separate quoted arguments. RT_DEV_BUILD=1 adds the test
+# settings RT_HEADLESS, RT_INPUT_SCRIPT and RT_PERF_LOG (runtime/include/rt.h);
+# the release (tools/package_release.sh) does not have them.
 compile() {
     "$LLVM/clang" -target $TRIPLE -O2 -g \
-        -Wall -Wextra -Wshadow -Wconversion -Wno-sign-conversion -Werror -DPTROFS_64BIT \
+        -Wall -Wextra -Wshadow -Wconversion -Wno-sign-conversion -Werror -DPTROFS_64BIT -DRT_DEV_BUILD=1 \
         -I"$PORT_DIR/runtime/include" -I"$PORT_DIR/third_party/SR/SR/llasm-support" -isystem "$FFMPEG/include" "$@"
 }
 
