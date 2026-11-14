@@ -18,9 +18,13 @@
  *    - release build: ~/Library/Application Support/Prototype Mac Port/
  *      GameCode/<id>/Prototype.bundle. If it does not exist, the converter
  *      makes it (one time) from the game files of the player, with a
- *      progress window. <id> comes from the SHA-256 values of this
- *      executable and of Recompiler/manifest.txt, so a new release makes a
- *      new bundle. The loader removes the bundles of other releases.
+ *      progress window. <id> comes from the SHA-256 values of
+ *      Recompiler/manifest.txt (the converter, the runtime and the
+ *      translation inputs) and of the libraries in Contents/Frameworks (the
+ *      bundle uses their symbols). A release that changes one of them makes
+ *      a new bundle; a release that changes only this executable (for
+ *      example the launcher window) keeps the bundle. The loader removes
+ *      the bundles with a different <id>.
  * 4. Open the bundle with dlopen and call rt_game_main on the main thread.
  *
  * The libraries and frameworks that the runtime uses are linked to this
@@ -442,26 +446,68 @@ static void mkdir_p(const char *path)
         fail(@"A folder cannot be made.", [NSString stringWithFormat:@"%s: %@", path, e.localizedDescription]);
 }
 
+/* One SHA-256 value for the files of Contents/Frameworks: the names in
+   sorted order, with the SHA-256 value of each file or the target of each
+   symbolic link. */
+static void frameworks_sum(char out[65])
+{
+    NSString *fw = NSBundle.mainBundle.privateFrameworksPath;
+    NSError *e = nil;
+    NSArray<NSString *> *names;
+    NSMutableString *text = [NSMutableString string];
+
+    if (fw == nil) fail(@"The application is damaged.", @"Contents/Frameworks was not found.");
+    names = [NSFileManager.defaultManager contentsOfDirectoryAtPath:fw error:&e];
+    if (names == nil)
+        fail(@"The application is damaged.",
+             [NSString stringWithFormat:@"%@: %@", fw, e.localizedDescription]);
+    for (NSString *name in [names sortedArrayUsingSelector:@selector(compare:)])
+    {
+        char p[PATH_LEN], sum[65], err[PATH_LEN + 64];
+        struct stat st;
+        if (!join(p, sizeof p, fw.fileSystemRepresentation, name.fileSystemRepresentation))
+            fail(@"The application path is too long.", fw);
+        if (lstat(p, &st) != 0)
+            fail(@"The application is damaged.", [NSString stringWithFormat:@"%s: %s", p, strerror(errno)]);
+        if (S_ISLNK(st.st_mode))
+        {
+            char target[PATH_LEN];
+            ssize_t len = readlink(p, target, sizeof target - 1);
+            if (len < 0)
+                fail(@"The application is damaged.", [NSString stringWithFormat:@"%s: %s", p, strerror(errno)]);
+            target[len] = 0;
+            [text appendFormat:@"%@ -> %s\n", name, target];
+        }
+        else if (S_ISREG(st.st_mode))
+        {
+            if (!rt_sha256_file(p, sum, err, sizeof err)) fail(@"The application is damaged.", str(err));
+            [text appendFormat:@"%@ %s\n", name, sum];
+        }
+        else
+            fail(@"The application is damaged.", [NSString stringWithFormat:@"%s is not a file.", p]);
+    }
+    sha256_text(text.UTF8String, out);
+}
+
 static void get_bundle(const char *game_dir, char *bundle, size_t n)
 {
-    NSString *res = NSBundle.mainBundle.resourcePath, *exe = NSBundle.mainBundle.executablePath;
+    NSString *res = NSBundle.mainBundle.resourcePath;
     const char *home = getenv("HOME");
     char recompiler[PATH_LEN], manifest[PATH_LEN], base[PATH_LEN], dir[PATH_LEN], marker[PATH_LEN],
-        copy[PATH_LEN], work[PATH_LEN], err[PATH_LEN + 64], exe_sum[65], man_sum[65], key_text[160], key[65], id[17];
+        copy[PATH_LEN], work[PATH_LEN], err[PATH_LEN + 64], fw_sum[65], man_sum[65], key_text[160], key[65], id[17];
     convert_state *s;
     RTProgress *ui;
     pthread_t th;
     pthread_attr_t attr;
     FILE *f;
 
-    if (res == nil || exe == nil || home == NULL) fail(@"The application is damaged.", @"The resources were not found.");
+    if (res == nil || home == NULL) fail(@"The application is damaged.", @"The resources were not found.");
     if (!join(recompiler, sizeof recompiler, res.fileSystemRepresentation, "Recompiler") ||
         !join(manifest, sizeof manifest, recompiler, "manifest.txt") || !is_file(manifest))
         fail(@"The application is damaged.", @"Contents/Resources/Recompiler/manifest.txt was not found.");
-    if (!rt_sha256_file(exe.fileSystemRepresentation, exe_sum, err, sizeof err) ||
-        !rt_sha256_file(manifest, man_sum, err, sizeof err))
-        fail(@"The application is damaged.", str(err));
-    snprintf(key_text, sizeof key_text, "%s\n%s\n", exe_sum, man_sum);
+    if (!rt_sha256_file(manifest, man_sum, err, sizeof err)) fail(@"The application is damaged.", str(err));
+    frameworks_sum(fw_sum);
+    snprintf(key_text, sizeof key_text, "%s\n%s\n", man_sum, fw_sum);
     sha256_text(key_text, key);
     memcpy(id, key, 16);
     id[16] = 0;
