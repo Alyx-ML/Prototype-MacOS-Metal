@@ -50,9 +50,11 @@
  *   2. The XeGTAO main pass: the normal from the depths, then for each
  *      slice direction the two horizon angles and the visibility integral.
  *      Slices and steps per slice: low 1 x 2, medium 2 x 2, high 3 x 3
- *      (the XeGTAO quality presets low, medium and high). The noise is the
- *      Hilbert curve index with the R2 sequence; the game has no temporal
- *      filter, so the noise does not change from frame to frame.
+ *      (the XeGTAO quality presets low, medium and high), constants of the
+ *      pipeline of each level. The noise is the Hilbert curve index (a
+ *      64 x 64 texture that is calculated once) with the R2 sequence; the
+ *      game has no temporal filter, so the noise does not change from frame
+ *      to frame.
  *   3. Two passes of the XeGTAO edge-aware denoise filter. The second
  *      pass is a fragment shader that multiplies the scene texture
  *      (p3dFrameBufferCurrent of the composite shader) in place by the
@@ -89,8 +91,11 @@ static const char ao_src[] =
     "    float mpx, mpy, da, db;\n"   /* mul * pixel size; P22, P23 */
     "    float radius, falloff, power, mipoff;\n"
     "    float beta, pad;\n"
-    "    uint slices, steps;\n"
     "};\n"
+    /* The slices and the steps of the quality level: constants of the
+       pipeline (ao_of), so the compiler unrolls the loops of ao_main. */
+    "constant uint SLICES [[function_constant(0)]];\n"
+    "constant uint STEPS [[function_constant(1)]];\n"
     "#define SKY 1.0e6\n"
     "static float view_z(float z, constant AOC &c)\n"
     "{\n"
@@ -189,22 +194,11 @@ static const char ao_src[] =
     "    e = min(abs(e), abs(es));\n"
     "    return saturate(1.25 - e / (z * 0.011));\n"
     "}\n"
-    "static uint hilbert(uint x, uint y)\n"
-    "{\n"
-    "    uint index = 0;\n"
-    "    for (uint lvl = 32; lvl > 0; lvl /= 2) {\n"
-    "        uint rx = (x & lvl) > 0 ? 1 : 0, ry = (y & lvl) > 0 ? 1 : 0;\n"
-    "        index += lvl * lvl * ((3 * rx) ^ ry);\n"
-    "        if (ry == 0) {\n"
-    "            if (rx == 1) { x = 63 - x; y = 63 - y; }\n"
-    "            uint t = x; x = y; y = t;\n"
-    "        }\n"
-    "    }\n"
-    "    return index;\n"
-    "}\n"
+    /* hl: the Hilbert curve index of each pixel of a 64 x 64 tile
+       (hilbert_texture). */
     "kernel void ao_main(texture2d<float> dz [[texture(0)]], texture2d<float, access::write> ao [[texture(1)]],\n"
-    "    texture2d<float, access::write> eo [[texture(2)]], constant AOC &c [[buffer(0)]],\n"
-    "    uint2 p [[thread_position_in_grid]])\n"
+    "    texture2d<float, access::write> eo [[texture(2)]], texture2d<ushort, access::read> hl [[texture(3)]],\n"
+    "    constant AOC &c [[buffer(0)]], uint2 p [[thread_position_in_grid]])\n"
     "{\n"
     "    constexpr sampler pc(filter::nearest, mip_filter::nearest, address::clamp_to_edge);\n"
     "    if (p.x >= ao.get_width() || p.y >= ao.get_height()) return;\n"
@@ -235,15 +229,15 @@ static const char ao_src[] =
     "    float mins = 1.3 / sr;\n"
     "    float fr = c.falloff * c.radius, ff = c.radius * (1.0 - c.falloff);\n"
     "    float fm = -1.0 / fr, fa = ff / fr + 1.0;\n"
-    "    uint hi = hilbert(p.x % 64, p.y % 64);\n"
+    "    uint hi = hl.read(p % 64).r;\n"
     "    float nslice = fract(0.5 + float(hi) * 0.75487766624669276);\n"
     "    float nsample = fract(0.5 + float(hi) * 0.56984029099805326);\n"
     /* Half precision for the directions, the angles and the horizon
        cosines, as XE_GTAO_USE_HALF_FLOAT_PRECISION of XeGTAO; positions,
        distances and sample offsets stay in float. */
     "    half3 Vh = half3(V), Nh = half3(N);\n"
-    "    for (uint s = 0; s < c.slices; s++) {\n"
-    "        half phi = half((float(s) + nslice) / float(c.slices)) * M_PI_H;\n"
+    "    for (uint s = 0; s < SLICES; s++) {\n"
+    "        half phi = half((float(s) + nslice) / float(SLICES)) * M_PI_H;\n"
     "        half cp = cos(phi), spi = sin(phi);\n"
     "        float2 om = float2(float(cp), -float(spi)) * sr;\n"
     "        half3 dv = half3(cp, spi, 0.0h);\n"
@@ -256,9 +250,9 @@ static const char ao_src[] =
     "        half n = sgn * acos(cn);\n"
     "        half lo0 = cos(n + M_PI_2_H), lo1 = cos(n - M_PI_2_H);\n"
     "        half h0c = lo0, h1c = lo1;\n"
-    "        for (uint j = 0; j < c.steps; j++) {\n"
-    "            float sn = fract(nsample + float(s + j * c.steps) * 0.6180339887498948);\n"
-    "            float st = (float(j) + sn) / float(c.steps);\n"
+    "        for (uint j = 0; j < STEPS; j++) {\n"
+    "            float sn = fract(nsample + float(s + j * STEPS) * 0.6180339887498948);\n"
+    "            float st = (float(j) + sn) / float(STEPS);\n"
     "            st = st * st + mins;\n" /* sample distribution power 2 */
     "            float2 so = st * om;\n"
     "            float mip = clamp(log2(length(so)) - c.mipoff, 0.0, 4.0);\n"
@@ -280,7 +274,7 @@ static const char ao_src[] =
     "        half i1 = (cn + 2.0h * h1 * sin(n) - cos(2.0h * h1 - n)) * 0.25h;\n"
     "        vis += float(pl * (i0 + i1));\n"
     "    }\n"
-    "    vis /= float(c.slices);\n"
+    "    vis /= float(SLICES);\n"
     "    vis = pow(saturate(vis), c.power);\n"
     "    ao.write(float4(max(0.03, vis)), p);\n"
     "}\n"
@@ -344,14 +338,18 @@ typedef struct ao_consts {
     float mpx, mpy, da, db;
     float radius, falloff, power, mipoff;
     float beta, pad;
-    uint32_t slices, steps;
 } ao_consts;
+
+/* Slices and steps per slice of the quality levels 1 to 3 (index 0 is not
+   used): the XeGTAO presets low, medium and high. */
+static const uint32_t ao_slices[4] = { 0, 1, 2, 3 }, ao_steps[4] = { 0, 2, 2, 3 };
 
 @interface D3DAO : NSObject
 {
 @public
     id<MTLLibrary> lib;
-    id<MTLComputePipelineState> prefilter, prefilter_ms, main_pso, denoise;
+    id<MTLComputePipelineState> prefilter, prefilter_ms, main_pso[4], denoise;
+    id<MTLTexture> hilbert;
     id<MTLRenderPipelineState> apply_pso;
     MTLPixelFormat apply_fmt;
     id<MTLTexture> depths, mip[AO_MIPS], ao0, ao1, edges;
@@ -384,18 +382,71 @@ static id<MTLComputePipelineState> ao_kernel(D3DDevice *d, D3DAO *a, const char 
     return s;
 }
 
+/* The Hilbert curve index of each pixel of a 64 x 64 tile (the noise of
+   ao_main), as in XeGTAO. */
+static id<MTLTexture> hilbert_texture(D3DDevice *d)
+{
+    static uint16_t data[64 * 64];
+    MTLTextureDescriptor *td;
+    id<MTLTexture> t;
+    uint32_t px, py;
+    for (py = 0; py < 64; py++)
+        for (px = 0; px < 64; px++)
+        {
+            uint32_t x = px, y = py, index = 0, lvl;
+            for (lvl = 32; lvl > 0; lvl /= 2)
+            {
+                uint32_t rx = (x & lvl) > 0 ? 1u : 0u, ry = (y & lvl) > 0 ? 1u : 0u;
+                index += lvl * lvl * ((3u * rx) ^ ry);
+                if (ry == 0)
+                {
+                    uint32_t tmp;
+                    if (rx == 1)
+                    {
+                        x = 63 - x;
+                        y = 63 - y;
+                    }
+                    tmp = x;
+                    x = y;
+                    y = tmp;
+                }
+            }
+            data[py * 64 + px] = (uint16_t)index; /* index < 4096 */
+        }
+    td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR16Uint width:64 height:64 mipmapped:NO];
+    td.storageMode = MTLStorageModeShared;
+    td.usage = MTLTextureUsageShaderRead;
+    t = [d->mtl newTextureWithDescriptor:td];
+    if (t == nil) rt_fatal("D3D9: out of video memory (ambient occlusion noise texture)");
+    [t replaceRegion:MTLRegionMake2D(0, 0, 64, 64) mipmapLevel:0 withBytes:data bytesPerRow:64 * sizeof(uint16_t)];
+    return t;
+}
+
 static D3DAO *ao_of(D3DDevice *d)
 {
     if (d->ao == nil)
     {
         D3DAO *a = [D3DAO new];
         NSError *err = nil;
+        int q;
         a->lib = [d->mtl newLibraryWithSource:@(ao_src) options:[MTLCompileOptions new] error:&err];
         if (a->lib == nil)
             rt_fatal("D3D9: Metal compile of the ambient occlusion shaders failed: %s", err.localizedDescription.UTF8String);
         a->prefilter = ao_kernel(d, a, "ao_prefilter");
         a->prefilter_ms = ao_kernel(d, a, "ao_prefilter_ms");
-        a->main_pso = ao_kernel(d, a, "ao_main");
+        for (q = 1; q < 4; q++)
+        {
+            MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new];
+            id<MTLFunction> f;
+            [cv setConstantValue:&ao_slices[q] type:MTLDataTypeUInt atIndex:0];
+            [cv setConstantValue:&ao_steps[q] type:MTLDataTypeUInt atIndex:1];
+            f = [a->lib newFunctionWithName:@"ao_main" constantValues:cv error:&err];
+            if (f == nil) rt_fatal("D3D9: ambient occlusion function ao_main is missing: %s", err.localizedDescription.UTF8String);
+            a->main_pso[q] = [d->mtl newComputePipelineStateWithFunction:f error:&err];
+            if (a->main_pso[q] == nil)
+                rt_fatal("D3D9: ambient occlusion pipeline ao_main creation failed: %s", err.localizedDescription.UTF8String);
+        }
+        a->hilbert = hilbert_texture(d);
         a->denoise = ao_kernel(d, a, "ao_denoise");
         d->ao = a;
     }
@@ -593,7 +644,6 @@ static id<MTLRenderPipelineState> apply_pipeline(D3DDevice *d, D3DAO *a, MTLPixe
 
 void d3d_ao_apply(D3DDevice *d, D3DShader *ps)
 {
-    static const uint32_t slices[4] = { 0, 1, 2, 3 }, steps[4] = { 0, 2, 2, 3 };
     int q = rt_enh_get(RT_ENH_AO);
     D3DAO *a;
     rt_com_object *o;
@@ -631,7 +681,7 @@ void d3d_ao_apply(D3DDevice *d, D3DShader *ps)
     if (!a->logged_start)
     {
         rt_log("D3D9: XeGTAO ambient occlusion %lux%lu, %u slices x %u steps", (unsigned long)w, (unsigned long)h,
-               slices[q], steps[q]);
+               ao_slices[q], ao_steps[q]);
         a->logged_start = true;
     }
     @autoreleasepool
@@ -656,8 +706,6 @@ void d3d_ao_apply(D3DDevice *d, D3DShader *ps)
         c.power = 2.2f;
         c.mipoff = 3.30f;
         c.beta = 1.2f;
-        c.slices = slices[q];
-        c.steps = steps[q];
 
         ce = [d->cb computeCommandEncoder];
         if (ce == nil) rt_fatal("D3D9: ambient occlusion compute encoder creation failed");
@@ -671,7 +719,8 @@ void d3d_ao_apply(D3DDevice *d, D3DShader *ps)
         [ce setTexture:a->depths atIndex:0];
         [ce setTexture:a->ao0 atIndex:1];
         [ce setTexture:a->edges atIndex:2];
-        dispatch(ce, a->main_pso, w, h);
+        [ce setTexture:a->hilbert atIndex:3];
+        dispatch(ce, a->main_pso[q], w, h);
         /* Two denoise passes: the first with less weight on the center. The
            second is the fragment shader of the multiply into the scene. */
         beta = c.beta / 5.0f;

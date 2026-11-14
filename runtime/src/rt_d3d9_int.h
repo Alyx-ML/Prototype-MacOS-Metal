@@ -603,10 +603,50 @@ extern const rt_com_class d3d_device_class;
 void d3d_draw_init(D3DDevice *d);
 /* Present the back buffer to the window layer and commit the frame. */
 void d3d_present(D3DDevice *d);
+/* Contrast-adaptive sharpening (the method of AMD FidelityFX CAS) of the
+   pixel p of src, in the Metal shading language. The sharpening amount of
+   each pixel depends on the local contrast of its 3x3 neighborhood, so
+   edges with high contrast do not get halos. The sharpening pass of
+   rt_d3d9_post.m (cas_fs) and the present shader of rt_d3d9_draw.m use it. */
+#define D3D_CAS_MSL                                                                                         \
+    "static float4 cas_px(texture2d<float> src, int2 p, float sharp)\n"                                     \
+    "{\n"                                                                                                   \
+    "    int2 sz = int2(src.get_width(), src.get_height()) - 1;\n"                                          \
+    "    float3 a = src.read(uint2(clamp(p + int2(-1, -1), int2(0), sz))).rgb;\n"                           \
+    "    float3 b = src.read(uint2(clamp(p + int2(0, -1), int2(0), sz))).rgb;\n"                            \
+    "    float3 c = src.read(uint2(clamp(p + int2(1, -1), int2(0), sz))).rgb;\n"                            \
+    "    float3 d = src.read(uint2(clamp(p + int2(-1, 0), int2(0), sz))).rgb;\n"                            \
+    "    float4 e4 = src.read(uint2(p));\n"                                                                 \
+    "    float3 e = e4.rgb;\n"                                                                              \
+    "    float3 f = src.read(uint2(clamp(p + int2(1, 0), int2(0), sz))).rgb;\n"                             \
+    "    float3 g = src.read(uint2(clamp(p + int2(-1, 1), int2(0), sz))).rgb;\n"                            \
+    "    float3 h = src.read(uint2(clamp(p + int2(0, 1), int2(0), sz))).rgb;\n"                             \
+    "    float3 i = src.read(uint2(clamp(p + int2(1, 1), int2(0), sz))).rgb;\n"                             \
+    "    float3 mn = min(min(min(d, e), min(f, b)), h);\n"                                                  \
+    "    mn += min(mn, min(min(a, c), min(g, i)));\n"                                                       \
+    "    float3 mx = max(max(max(d, e), max(f, b)), h);\n"                                                  \
+    "    mx += max(mx, max(max(a, c), max(g, i)));\n"                                                       \
+    "    float3 amp = sqrt(saturate(min(mn, 2.0 - mx) / max(mx, 1e-5)));\n"                                 \
+    "    float3 w = amp * (-1.0 / mix(8.0, 5.0, sharp));\n"                                                 \
+    "    float3 r = ((b + d + f + h) * w + e) / (1.0 + 4.0 * w);\n"                                         \
+    "    return float4(max(r, 0.0), e4.a);\n"                                                               \
+    "}\n"
+
+/* The sharpening that the present pass applies (d3d_post_process). mode 0:
+   none; 1: sharpen, and clamp the result to 0..1 (the source has a
+   normalized format, so a sharpening pass into a texture of that format
+   would clamp it); 2: sharpen without the clamp (a float format). */
+typedef struct d3d_present_cas {
+    uint32_t mode;
+    float amount;
+} d3d_present_cas;
+
 /* Post-processing of the presented frame (rt_d3d9_post.m). Returns the
    texture that the present pass samples; out_w and out_h are the size of the
-   image in the drawable. */
-id<MTLTexture> d3d_post_process(D3DDevice *d, id<MTLTexture> src, uint32_t out_w, uint32_t out_h);
+   image in the drawable. When the sharpening is on and the image before it
+   has the size out_w x out_h, the sharpening is not a pass of its own: cas
+   tells the present pass to sharpen each pixel as it reads it. */
+id<MTLTexture> d3d_post_process(D3DDevice *d, id<MTLTexture> src, uint32_t out_w, uint32_t out_h, d3d_present_cas *cas);
 /* Sets the layer for the HDR setting and returns the EDR headroom of the
    display (1 when the display has none). */
 float d3d_post_hdr_begin(D3DDevice *d);

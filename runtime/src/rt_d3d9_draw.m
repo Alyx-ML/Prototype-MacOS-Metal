@@ -110,7 +110,10 @@ static const char builtin_src[] =
     /* gt7: apply the EDR expansion and GT7 in HDR mode (a frame without
        the scene pass). scene: the scene pass wrote the HDR back buffer;
        the present shader only decodes it, so the HUD stays at SDR white. */
-    "struct PresentParams { uint use_lut; uint hdr; float headroom; uint src_linear; uint gt7; uint scene; GT7P g; };\n"
+    /* cas, sharp: the sharpening of d3d_present_cas (cas_px of
+       D3D_CAS_MSL); the source then has the size of the viewport. */
+    "struct PresentParams { uint use_lut; uint hdr; float headroom; uint src_linear; uint gt7; uint scene; uint cas; float sharp; GT7P g; };\n"
+    D3D_CAS_MSL
     "static float gt7_curve(float x, constant GT7P &p)\n"
     "{\n"
     "    const float mid = 0.538, lin = 0.444, toe = 1.280;\n"
@@ -173,7 +176,13 @@ static const char builtin_src[] =
     "fragment float4 present_fs(QV in [[stage_in]], texture2d<float> src [[texture(0)]],\n"
     "    texture2d<float> lut [[texture(1)]], sampler s [[sampler(0)]], constant PresentParams &pp [[buffer(0)]])\n"
     "{\n"
-    "    float4 c = src.sample(s, in.uv);\n"
+    "    float4 c;\n"
+    "    if (pp.cas != 0u) {\n"
+    "        int2 sz = int2(src.get_width(), src.get_height());\n"
+    "        c = cas_px(src, min(int2(in.uv * float2(sz)), sz - 1), pp.sharp);\n"
+    "        if (pp.cas == 1u) c.rgb = saturate(c.rgb);\n"
+    "    } else\n"
+    "        c = src.sample(s, in.uv);\n"
     "    if (pp.src_linear != 0u) c.rgb = to_srgb(saturate(c.rgb));\n"
     "    if (pp.use_lut != 0u) {\n"
     "        constexpr sampler ls(filter::linear, address::clamp_to_edge);\n"
@@ -2798,6 +2807,7 @@ void d3d_present(D3DDevice *d)
                 uint32_t use_lut, hdr;
                 float headroom;
                 uint32_t src_linear, gt7, scene;
+                d3d_present_cas cas;
                 d3d_gt7_params g;
             } pp_args;
             double dw = size.width, dh = size.height, bw = bb->width, bh = bb->height;
@@ -2826,7 +2836,7 @@ void d3d_present(D3DDevice *d)
             vp.znear = 0;
             vp.zfar = 1;
             /* Mac enhancements: SMAA, MetalFX upscaling, sharpening. */
-            src = d3d_post_process(d, src, (uint32_t)vp.width, (uint32_t)vp.height);
+            src = d3d_post_process(d, src, (uint32_t)vp.width, (uint32_t)vp.height, &pp_args.cas);
             if (dfmt != MTLPixelFormatBGRA8Unorm && dfmt != MTLPixelFormatRGBA16Float)
                 rt_fatal("D3D9: the drawable has the pixel format %lu (expected BGRA8Unorm or RGBA16Float)", (unsigned long)dfmt);
             pp_args.hdr = dfmt == MTLPixelFormatRGBA16Float;

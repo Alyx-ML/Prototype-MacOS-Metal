@@ -24,7 +24,10 @@
  *   2. MetalFX spatial upscaling from the back buffer size to the size of
  *      the image in the drawable, if the drawable image is larger.
  *   3. Contrast-adaptive sharpening (the method of AMD FidelityFX CAS) at the
- *      size of the result of step 2.
+ *      size of the result of step 2. When that size is the size of the
+ *      image in the drawable (always after MetalFX upscaling), the present pass
+ *      sharpens each pixel as it reads it (d3d_present_cas), so the frame
+ *      is not written and read again at the drawable size.
  * The result is the texture that d3d_present samples.
  *
  * SMAA T2x (setting value 2): d3d_post_t2x runs at the bloom composite of
@@ -112,6 +115,8 @@ static const char post_src[] =
        has an edge. The depth value is the view depth (pr.y = P22,
        pr.z = P23: view depth = P23 / (z - P22)), and its edge test is
        relative: |difference| / view depth of the pixel. */
+    "static float dread(depth2d<float> t, int2 p) { return t.read(uint2(p)); }\n"
+    "static float dread(depth2d_ms<float> t, int2 p) { return t.read(uint2(p), 0); }\n"
     "static float view_depth(float z, float4 pr)\n"
     "{\n"
     "    float den = z - pr.y;\n"
@@ -139,27 +144,40 @@ static const char post_src[] =
     "    e *= step(max(m.x, m.y), 2.0 * dlt);\n"
     "    return float4(e, 0.0, 0.0);\n"
     "}\n"
-    "fragment float4 smaa_edges(PV in [[stage_in]], texture2d<float> src [[texture(0)]])\n"
+    /* The stencil value is 1 at a pixel with an edge: the weights pass runs
+       only at these pixels (all other pixels have the weights 0). */
+    "struct EO { float4 e [[color(0)]]; uint st [[stencil]]; };\n"
+    "static EO edge_out(float4 e)\n"
     "{\n"
-    "    return edges_at(src, int2(in.pos.xy), float2(0.05));\n"
+    "    EO o;\n"
+    "    o.e = e;\n"
+    "    o.st = e.x + e.y > 0.0 ? 1u : 0u;\n"
+    "    return o;\n"
     "}\n"
-    "fragment float4 smaa_edges_pred(PV in [[stage_in]], texture2d<float> src [[texture(0)]],\n"
+    "fragment EO smaa_edges(PV in [[stage_in]], texture2d<float> src [[texture(0)]])\n"
+    "{\n"
+    "    return edge_out(edges_at(src, int2(in.pos.xy), float2(0.05)));\n"
+    "}\n"
+    "template <typename D>\n"
+    "static float4 edges_pred_at(texture2d<float> src, D dep, int2 p, float4 pr, thread float &z)\n"
+    "{\n"
+    "    int2 sz = int2(dep.get_width(), dep.get_height());\n"
+    "    z = dread(dep, clampc(p, sz));\n"
+    "    float3 v = float3(view_depth(z, pr), view_depth(dread(dep, clampc(p + int2(-1, 0), sz)), pr),\n"
+    "        view_depth(dread(dep, clampc(p + int2(0, -1), sz)), pr));\n"
+    "    return edges_at(src, p, pred_threshold(v));\n"
+    "}\n"
+    "fragment EO smaa_edges_pred(PV in [[stage_in]], texture2d<float> src [[texture(0)]],\n"
     "    depth2d<float> dep [[texture(1)]], constant float4 &pr [[buffer(0)]])\n"
     "{\n"
-    "    int2 p = int2(in.pos.xy), sz = int2(dep.get_width(), dep.get_height());\n"
-    "    float3 v = float3(view_depth(dep.read(uint2(clampc(p, sz))), pr),\n"
-    "        view_depth(dep.read(uint2(clampc(p + int2(-1, 0), sz))), pr),\n"
-    "        view_depth(dep.read(uint2(clampc(p + int2(0, -1), sz))), pr));\n"
-    "    return edges_at(src, p, pred_threshold(v));\n"
+    "    float z;\n"
+    "    return edge_out(edges_pred_at(src, dep, int2(in.pos.xy), pr, z));\n"
     "}\n"
-    "fragment float4 smaa_edges_pred_ms(PV in [[stage_in]], texture2d<float> src [[texture(0)]],\n"
+    "fragment EO smaa_edges_pred_ms(PV in [[stage_in]], texture2d<float> src [[texture(0)]],\n"
     "    depth2d_ms<float> dep [[texture(1)]], constant float4 &pr [[buffer(0)]])\n"
     "{\n"
-    "    int2 p = int2(in.pos.xy), sz = int2(dep.get_width(), dep.get_height());\n"
-    "    float3 v = float3(view_depth(dep.read(uint2(clampc(p, sz)), 0), pr),\n"
-    "        view_depth(dep.read(uint2(clampc(p + int2(-1, 0), sz)), 0), pr),\n"
-    "        view_depth(dep.read(uint2(clampc(p + int2(0, -1), sz)), 0), pr));\n"
-    "    return edges_at(src, p, pred_threshold(v));\n"
+    "    float z;\n"
+    "    return edge_out(edges_pred_at(src, dep, int2(in.pos.xy), pr, z));\n"
     "}\n"
     "static float E(texture2d<float> t, int2 p, int2 sz, int ch)\n"
     "{\n"
@@ -178,6 +196,23 @@ static const char post_src[] =
     "    return area.read(uint2(n * ORTHO_SIZE + left, set * ORTHO_SIZE + right)).rg;\n"
     "}\n"
     "#define MAX_SEARCH 32\n"
+    /* The 2 x 2 edge values of columns c.x - 1 and c.x, rows c.y - 1 and
+       c.y, of one channel (ch 0: r, 1: g) in one read (gather), as E gives
+       them (0 outside the texture). The order is the order of gather:
+       x (c.x - 1, c.y), y (c.x, c.y), z (c.x, c.y - 1), w (c.x - 1, c.y - 1).
+       The coordinate is the corner between the four texels, half a texel
+       from each center, so rounding cannot move the footprint. The run
+       searches below read the edges of two pixels in each step with two
+       gathers, in place of six single reads, and stop at the same pixel. */
+    "static float4 E4(texture2d<float> t, int2 c, int2 sz, int ch)\n"
+    "{\n"
+    "    constexpr sampler gs(filter::linear, address::clamp_to_edge);\n"
+    "    float2 uv = float2(c) / float2(sz);\n"
+    "    float4 v = ch == 0 ? t.gather(gs, uv, int2(0), component::x) : t.gather(gs, uv, int2(0), component::y);\n"
+    "    bool x0 = c.x - 1 >= 0 && c.x - 1 < sz.x, x1 = c.x >= 0 && c.x < sz.x;\n"
+    "    bool y0 = c.y - 1 >= 0 && c.y - 1 < sz.y, y1 = c.y >= 0 && c.y < sz.y;\n"
+    "    return v * float4(x0 && y1, x1 && y1, x1 && y0, x0 && y0);\n"
+    "}\n"
     /* The corner factors of the two weights of a run (see the corner
        detection below). dd: distance to the first and the last pixel of the
        run. ce: the continued crossing edges at the first and the last end on
@@ -282,17 +317,23 @@ static const char post_src[] =
     "    if (e.y > 0.5) {\n"
     "        int xl = p.x, xr = p.x, i;\n"
     "        bool okl = true, okr = true;\n"
-    "        for (i = 0; i < MAX_SEARCH; i++) {\n"
-    "            int2 q = int2(xl, p.y);\n"
-    "            if (E(edges, q, sz, 0) > 0.5 || E(edges, q + int2(0, -1), sz, 0) > 0.5) break;\n"
-    "            if (E(edges, q + int2(-1, 0), sz, 1) < 0.5) break;\n"
+    /* Step at x: stop at a crossing edge (r of x in rows y and y - 1) or
+       at the end of the run (g of x - 1); two steps (x = xl, xl - 1) for
+       each pair of gathers. */
+    "        for (i = 0; i < MAX_SEARCH; i += 2) {\n"
+    "            float4 r = E4(edges, int2(xl, p.y), sz, 0), g = E4(edges, int2(xl - 1, p.y), sz, 1);\n"
+    "            if (r.y > 0.5 || r.z > 0.5 || g.y < 0.5) break;\n"
+    "            xl--;\n"
+    "            if (r.x > 0.5 || r.w > 0.5 || g.x < 0.5) { i++; break; }\n"
     "            xl--;\n"
     "        }\n"
     "        if (i == MAX_SEARCH) okl = false;\n"
-    "        for (i = 0; i < MAX_SEARCH; i++) {\n"
-    "            int2 q = int2(xr + 1, p.y);\n"
-    "            if (E(edges, q, sz, 0) > 0.5 || E(edges, q + int2(0, -1), sz, 0) > 0.5) break;\n"
-    "            if (E(edges, q, sz, 1) < 0.5) break;\n"
+    /* Step at x = xr + 1: r of x in rows y and y - 1, g of x. */
+    "        for (i = 0; i < MAX_SEARCH; i += 2) {\n"
+    "            float4 r = E4(edges, int2(xr + 2, p.y), sz, 0), g = E4(edges, int2(xr + 2, p.y), sz, 1);\n"
+    "            if (r.x > 0.5 || r.w > 0.5 || g.x < 0.5) break;\n"
+    "            xr++;\n"
+    "            if (r.y > 0.5 || r.z > 0.5 || g.y < 0.5) { i++; break; }\n"
     "            xr++;\n"
     "        }\n"
     "        if (i == MAX_SEARCH) okr = false;\n"
@@ -308,17 +349,23 @@ static const char post_src[] =
     "    if (e.x > 0.5) {\n"
     "        int yt = p.y, yb = p.y, i;\n"
     "        bool okt = true, okb = true;\n"
-    "        for (i = 0; i < MAX_SEARCH; i++) {\n"
-    "            int2 q = int2(p.x, yt);\n"
-    "            if (E(edges, q, sz, 1) > 0.5 || E(edges, q + int2(-1, 0), sz, 1) > 0.5) break;\n"
-    "            if (E(edges, q + int2(0, -1), sz, 0) < 0.5) break;\n"
+    /* Step at y: g of y in columns x and x - 1, r of y - 1 in column x;
+       two steps (y = yt, yt - 1). */
+    "        for (i = 0; i < MAX_SEARCH; i += 2) {\n"
+    "            float4 g = E4(edges, int2(p.x, yt), sz, 1), r = E4(edges, int2(p.x, yt - 1), sz, 0);\n"
+    "            if (g.y > 0.5 || g.x > 0.5 || r.y < 0.5) break;\n"
+    "            yt--;\n"
+    "            if (g.z > 0.5 || g.w > 0.5 || r.z < 0.5) { i++; break; }\n"
     "            yt--;\n"
     "        }\n"
     "        if (i == MAX_SEARCH) okt = false;\n"
-    "        for (i = 0; i < MAX_SEARCH; i++) {\n"
-    "            int2 q = int2(p.x, yb + 1);\n"
-    "            if (E(edges, q, sz, 1) > 0.5 || E(edges, q + int2(-1, 0), sz, 1) > 0.5) break;\n"
-    "            if (E(edges, q, sz, 0) < 0.5) break;\n"
+    /* Step at y = yb + 1: g of y in columns x and x - 1, r of y in column
+       x. */
+    "        for (i = 0; i < MAX_SEARCH; i += 2) {\n"
+    "            float4 g = E4(edges, int2(p.x, yb + 2), sz, 1), r = E4(edges, int2(p.x, yb + 2), sz, 0);\n"
+    "            if (g.z > 0.5 || g.w > 0.5 || r.z < 0.5) break;\n"
+    "            yb++;\n"
+    "            if (g.y > 0.5 || g.x > 0.5 || r.y < 0.5) { i++; break; }\n"
     "            yb++;\n"
     "        }\n"
     "        if (i == MAX_SEARCH) okb = false;\n"
@@ -366,7 +413,7 @@ static const char post_src[] =
     "}\n"
     /* SMAA T2x (rt_d3d9_post.m d3d_post_t2x). smaa_blend_t2x: the blend
        with SMAA_REPROJECTION: alpha = sqrt(5 * |velocity|), with the
-       velocity blended as the color. t2x_velocity: the screen motion of each
+       velocity blended as the color. velocity_of: the screen motion of each
        pixel from the previous frame (texture coordinates, current minus
        previous), from the depth and the camera of the two frames (inv:
        clip to world of this frame, prev: world to clip of the previous
@@ -402,15 +449,29 @@ static const char post_src[] =
     "    float2 q = cp.xy / cp.w;\n"
     "    return float4(uv - float2(q.x * 0.5 + 0.5, 0.5 - q.y * 0.5), 0.0, 0.0);\n"
     "}\n"
-    "fragment float4 t2x_velocity(PV in [[stage_in]], depth2d<float> dep [[texture(0)]], constant T2XV &m [[buffer(0)]])\n"
+    /* smaa_edges_vel: the edges with the depth predication and the
+       velocity in one pass (both read the depth of the pixel). */
+    "struct EVO { float4 e [[color(0)]]; float4 v [[color(1)]]; uint st [[stencil]]; };\n"
+    "template <typename D>\n"
+    "static EVO edges_vel(texture2d<float> src, D dep, int2 p, float4 pr, constant T2XV &m)\n"
     "{\n"
-    "    int2 p = int2(in.pos.xy), sz = int2(dep.get_width(), dep.get_height());\n"
-    "    return velocity_of(dep.read(uint2(p)), p, sz, m);\n"
+    "    float z;\n"
+    "    EO e = edge_out(edges_pred_at(src, dep, p, pr, z));\n"
+    "    EVO o;\n"
+    "    o.e = e.e;\n"
+    "    o.st = e.st;\n"
+    "    o.v = velocity_of(z, p, int2(dep.get_width(), dep.get_height()), m);\n"
+    "    return o;\n"
     "}\n"
-    "fragment float4 t2x_velocity_ms(PV in [[stage_in]], depth2d_ms<float> dep [[texture(0)]], constant T2XV &m [[buffer(0)]])\n"
+    "fragment EVO smaa_edges_vel(PV in [[stage_in]], texture2d<float> src [[texture(0)]],\n"
+    "    depth2d<float> dep [[texture(1)]], constant float4 &pr [[buffer(0)]], constant T2XV &m [[buffer(1)]])\n"
     "{\n"
-    "    int2 p = int2(in.pos.xy), sz = int2(dep.get_width(), dep.get_height());\n"
-    "    return velocity_of(dep.read(uint2(p), 0), p, sz, m);\n"
+    "    return edges_vel(src, dep, int2(in.pos.xy), pr, m);\n"
+    "}\n"
+    "fragment EVO smaa_edges_vel_ms(PV in [[stage_in]], texture2d<float> src [[texture(0)]],\n"
+    "    depth2d_ms<float> dep [[texture(1)]], constant float4 &pr [[buffer(0)]], constant T2XV &m [[buffer(1)]])\n"
+    "{\n"
+    "    return edges_vel(src, dep, int2(in.pos.xy), pr, m);\n"
     "}\n"
     "fragment float4 t2x_resolve(PV in [[stage_in]], texture2d<float> cur [[texture(0)]],\n"
     "    texture2d<float> prev [[texture(1)]], texture2d<float> vel [[texture(2)]], constant uint &hist [[buffer(0)]])\n"
@@ -433,31 +494,11 @@ static const char post_src[] =
     "        }\n"
     "    return float4(mix(c.rgb, clamp(pr.rgb, mn, mx), k), 1.0);\n"
     "}\n"
-    /* Contrast-adaptive sharpening: the sharpening amount of each pixel
-       depends on the local contrast of its 3x3 neighborhood, so edges with
-       high contrast do not get halos. */
+    /* Contrast-adaptive sharpening (D3D_CAS_MSL, rt_d3d9_int.h). */
+    D3D_CAS_MSL
     "fragment float4 cas_fs(PV in [[stage_in]], texture2d<float> src [[texture(0)]], constant float &sharp [[buffer(0)]])\n"
     "{\n"
-    "    int2 sz = int2(src.get_width(), src.get_height());\n"
-    "    int2 p = int2(in.pos.xy);\n"
-    "    float3 a = src.read(uint2(clampc(p + int2(-1, -1), sz))).rgb;\n"
-    "    float3 b = src.read(uint2(clampc(p + int2(0, -1), sz))).rgb;\n"
-    "    float3 c = src.read(uint2(clampc(p + int2(1, -1), sz))).rgb;\n"
-    "    float3 d = src.read(uint2(clampc(p + int2(-1, 0), sz))).rgb;\n"
-    "    float4 e4 = src.read(uint2(p));\n"
-    "    float3 e = e4.rgb;\n"
-    "    float3 f = src.read(uint2(clampc(p + int2(1, 0), sz))).rgb;\n"
-    "    float3 g = src.read(uint2(clampc(p + int2(-1, 1), sz))).rgb;\n"
-    "    float3 h = src.read(uint2(clampc(p + int2(0, 1), sz))).rgb;\n"
-    "    float3 i = src.read(uint2(clampc(p + int2(1, 1), sz))).rgb;\n"
-    "    float3 mn = min(min(min(d, e), min(f, b)), h);\n"
-    "    mn += min(mn, min(min(a, c), min(g, i)));\n"
-    "    float3 mx = max(max(max(d, e), max(f, b)), h);\n"
-    "    mx += max(mx, max(max(a, c), max(g, i)));\n"
-    "    float3 amp = sqrt(saturate(min(mn, 2.0 - mx) / max(mx, 1e-5)));\n"
-    "    float3 w = amp * (-1.0 / mix(8.0, 5.0, sharp));\n"
-    "    float3 r = ((b + d + f + h) * w + e) / (1.0 + 4.0 * w);\n"
-    "    return float4(max(r, 0.0), e4.a);\n"
+    "    return cas_px(src, int2(in.pos.xy), sharp);\n"
     "}\n";
 
 @interface D3DPost : NSObject
@@ -465,6 +506,10 @@ static const char post_src[] =
 @public
     id<MTLLibrary> lib;
     id<MTLRenderPipelineState> edges_pso, edges_pred_pso, edges_pred_ms_pso, weights_pso, blend_pso, cas_pso;
+    /* The stencil of the SMAA passes (smaa_edges_weights): the edges pass
+       writes it, the weights pass tests it. */
+    id<MTLDepthStencilState> stencil_write, stencil_test;
+    id<MTLTexture> stencil;
     bool pred_logged;
     MTLPixelFormat pso_format;
     id<MTLTexture> edges, weights, smaa_out, cas_out, fx_out, area_diag, area_ortho;
@@ -473,7 +518,7 @@ static const char post_src[] =
        velocity of this frame. prev_vp: the camera of the last resolved frame,
        prev_frame: present_count + 1 of that frame (0 = none). live: the last
        frame had the resolve, so this frame has the jitter. */
-    id<MTLRenderPipelineState> blend_t2x_pso, vel_pso, vel_ms_pso, resolve_pso;
+    id<MTLRenderPipelineState> blend_t2x_pso, edges_vel_pso, edges_vel_ms_pso, resolve_pso;
     MTLPixelFormat t2x_format;
     id<MTLTexture> t2x_col[2], t2x_vel;
     float prev_vp[4][4];
@@ -795,13 +840,122 @@ static void post_pass(D3DDevice *d, id<MTLRenderPipelineState> pso, id<MTLTextur
     [e endEncoding];
 }
 
+/* A pipeline of the SMAA edges pass (stencil output; vel: the velocity of
+   SMAA T2x in color attachment 1) or of the weights pass (stencil test). */
+static id<MTLRenderPipelineState> smaa_pso(D3DDevice *d, D3DPost *p, const char *fs, MTLPixelFormat fmt, bool vel)
+{
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    NSError *err = nil;
+    id<MTLRenderPipelineState> s;
+    pd.vertexFunction = [p->lib newFunctionWithName:@"post_vs"];
+    pd.fragmentFunction = [p->lib newFunctionWithName:@(fs)];
+    if (pd.vertexFunction == nil || pd.fragmentFunction == nil) rt_fatal("D3D9: post-processing function %s is missing", fs);
+    pd.colorAttachments[0].pixelFormat = fmt;
+    if (vel) pd.colorAttachments[1].pixelFormat = MTLPixelFormatRG16Float;
+    pd.stencilAttachmentPixelFormat = MTLPixelFormatStencil8;
+    s = [d->mtl newRenderPipelineStateWithDescriptor:pd error:&err];
+    if (s == nil) rt_fatal("D3D9: post-processing pipeline %s creation failed: %s", fs, err.localizedDescription.UTF8String);
+    return s;
+}
+
+static id<MTLDepthStencilState> smaa_stencil_state(D3DDevice *d, bool write)
+{
+    MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
+    MTLStencilDescriptor *sd = [MTLStencilDescriptor new];
+    id<MTLDepthStencilState> s;
+    /* write: the stencil value of the fragment shader (Replace). test: only
+       the pixels with the value 1 (the reference value). */
+    sd.stencilCompareFunction = write ? MTLCompareFunctionAlways : MTLCompareFunctionEqual;
+    sd.depthStencilPassOperation = write ? MTLStencilOperationReplace : MTLStencilOperationKeep;
+    sd.writeMask = write ? 0xFFu : 0u;
+    dd.frontFaceStencil = sd;
+    dd.backFaceStencil = sd;
+    s = [d->mtl newDepthStencilStateWithDescriptor:dd];
+    if (s == nil) rt_fatal("D3D9: SMAA stencil state creation failed");
+    return s;
+}
+
+/* SMAA passes 1 and 2. The edges of src go into e (with the depth
+   predication when depth is not nil, pr: its constants; with the velocity
+   of SMAA T2x into vel when vel is not nil, m: its matrices), and the
+   blend weights for the subsample sets si into w. The edges pass sets the
+   stencil to 1 at the pixels with an edge. The weights pass runs only at
+   these pixels; the other pixels keep the clear value 0, which is the
+   result of the weights shader for a pixel without an edge. */
+static void smaa_edges_weights(D3DDevice *d, D3DPost *p, id<MTLTexture> src, id<MTLTexture> e, id<MTLTexture> w,
+                               id<MTLTexture> depth, const float pr[4], id<MTLTexture> vel, const void *m, NSUInteger mlen,
+                               const int32_t si[4], const char *what)
+{
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    id<MTLRenderCommandEncoder> enc;
+    id<MTLRenderPipelineState> pso;
+    id<MTLTexture> st = post_tex(d, &p->stencil, src.width, src.height, MTLPixelFormatStencil8, MTLTextureUsageRenderTarget);
+    bool ms = depth != nil && depth.sampleCount > 1;
+    if (vel != nil)
+        pso = ms ? p->edges_vel_ms_pso : p->edges_vel_pso;
+    else if (depth != nil)
+        pso = ms ? p->edges_pred_ms_pso : p->edges_pred_pso;
+    else
+        pso = p->edges_pso;
+    rp.colorAttachments[0].texture = e;
+    rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    if (vel != nil)
+    {
+        rp.colorAttachments[1].texture = vel;
+        rp.colorAttachments[1].loadAction = MTLLoadActionDontCare;
+        rp.colorAttachments[1].storeAction = MTLStoreActionStore;
+    }
+    /* Each pixel gets its stencil value from the shader. */
+    rp.stencilAttachment.texture = st;
+    rp.stencilAttachment.loadAction = MTLLoadActionDontCare;
+    rp.stencilAttachment.storeAction = MTLStoreActionStore;
+    enc = [d->cb renderCommandEncoderWithDescriptor:rp];
+    if (enc == nil) rt_fatal("D3D9: %s edges encoder creation failed", what);
+    enc.label = [NSString stringWithFormat:@"%s edges", what];
+    [enc setRenderPipelineState:pso];
+    [enc setDepthStencilState:p->stencil_write];
+    [enc setFragmentTexture:src atIndex:0];
+    if (depth != nil)
+    {
+        [enc setFragmentTexture:depth atIndex:1];
+        [enc setFragmentBytes:pr length:4 * sizeof(float) atIndex:0];
+    }
+    if (vel != nil) [enc setFragmentBytes:m length:mlen atIndex:1];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [enc endEncoding];
+
+    rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = w;
+    rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+    rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    rp.stencilAttachment.texture = st;
+    rp.stencilAttachment.loadAction = MTLLoadActionLoad;
+    rp.stencilAttachment.storeAction = MTLStoreActionDontCare;
+    enc = [d->cb renderCommandEncoderWithDescriptor:rp];
+    if (enc == nil) rt_fatal("D3D9: %s weights encoder creation failed", what);
+    enc.label = [NSString stringWithFormat:@"%s weights", what];
+    [enc setRenderPipelineState:p->weights_pso];
+    [enc setDepthStencilState:p->stencil_test];
+    [enc setStencilReferenceValue:1];
+    [enc setFragmentTexture:e atIndex:0];
+    [enc setFragmentTexture:diag_texture(d, p) atIndex:1];
+    [enc setFragmentTexture:ortho_texture(d, p) atIndex:2];
+    [enc setFragmentBytes:si length:4 * sizeof(int32_t) atIndex:0];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [enc endEncoding];
+}
+
 static void ensure_psos(D3DDevice *d, D3DPost *p, MTLPixelFormat fmt)
 {
     if (p->edges_pso != nil && p->pso_format == fmt) return;
-    p->edges_pso = post_pso(d, p, "smaa_edges", MTLPixelFormatRG8Unorm);
-    p->edges_pred_pso = post_pso(d, p, "smaa_edges_pred", MTLPixelFormatRG8Unorm);
-    p->edges_pred_ms_pso = post_pso(d, p, "smaa_edges_pred_ms", MTLPixelFormatRG8Unorm);
-    p->weights_pso = post_pso(d, p, "smaa_weights", MTLPixelFormatRGBA8Unorm);
+    p->edges_pso = smaa_pso(d, p, "smaa_edges", MTLPixelFormatRG8Unorm, false);
+    p->edges_pred_pso = smaa_pso(d, p, "smaa_edges_pred", MTLPixelFormatRG8Unorm, false);
+    p->edges_pred_ms_pso = smaa_pso(d, p, "smaa_edges_pred_ms", MTLPixelFormatRG8Unorm, false);
+    p->weights_pso = smaa_pso(d, p, "smaa_weights", MTLPixelFormatRGBA8Unorm, false);
+    p->stencil_write = smaa_stencil_state(d, true);
+    p->stencil_test = smaa_stencil_state(d, false);
     p->blend_pso = post_pso(d, p, "smaa_blend", fmt);
     p->cas_pso = post_pso(d, p, "cas_fs", fmt);
     p->pso_format = fmt;
@@ -815,8 +969,8 @@ static void ensure_t2x_psos(D3DDevice *d, D3DPost *p, MTLPixelFormat fmt)
     NSError *err = nil;
     if (p->resolve_pso != nil && p->t2x_format == fmt) return;
     p->blend_t2x_pso = post_pso(d, p, "smaa_blend_t2x", fmt);
-    p->vel_pso = post_pso(d, p, "t2x_velocity", MTLPixelFormatRG16Float);
-    p->vel_ms_pso = post_pso(d, p, "t2x_velocity_ms", MTLPixelFormatRG16Float);
+    p->edges_vel_pso = smaa_pso(d, p, "smaa_edges_vel", MTLPixelFormatRG8Unorm, true);
+    p->edges_vel_ms_pso = smaa_pso(d, p, "smaa_edges_vel_ms", MTLPixelFormatRG8Unorm, true);
     pd = [MTLRenderPipelineDescriptor new];
     pd.vertexFunction = [p->lib newFunctionWithName:@"post_vs"];
     pd.fragmentFunction = [p->lib newFunctionWithName:@"t2x_resolve"];
@@ -928,12 +1082,6 @@ bool d3d_post_t2x(D3DDevice *d)
     set = p->t2x_live ? (int)cur + 1 : 0;
     si[0] = si[1] = si[2] = set;
     si[3] = 0;
-    {
-        const float pr[4] = { 1.0f, pz[0], pz[1], 0.0f };
-        post_pass(d, depth.sampleCount > 1 ? p->edges_pred_ms_pso : p->edges_pred_pso, e, src, depth, nil, pr, sizeof pr,
-                  "SMAA T2x edges");
-    }
-    post_pass(d, p->weights_pso, w, e, diag_texture(d, p), ortho_texture(d, p), si, sizeof si, "SMAA T2x weights");
     /* MSL float4x4 is column-major: element (row i, column j) at j * 4 + i. */
     hist = p->prev_frame == d->present_count ? 1u : 0u;
     for (i = 0; i < 4; i++)
@@ -942,7 +1090,10 @@ bool d3d_post_t2x(D3DDevice *d)
             m.inv[j * 4 + i] = (float)inv[i * 4 + j];
             m.prev[j * 4 + i] = hist ? p->prev_vp[i][j] : vpm[i][j];
         }
-    post_pass(d, depth.sampleCount > 1 ? p->vel_ms_pso : p->vel_pso, vel, depth, nil, nil, &m, sizeof m, "SMAA T2x velocity");
+    {
+        const float pr[4] = { 1.0f, pz[0], pz[1], 0.0f };
+        smaa_edges_weights(d, p, src, e, w, depth, pr, vel, &m, sizeof m, si, "SMAA T2x");
+    }
     post_pass(d, p->blend_t2x_pso, col, src, w, vel, NULL, 0, "SMAA T2x blend");
     rp = [MTLRenderPassDescriptor renderPassDescriptor];
     rp.colorAttachments[0].texture = src;
@@ -1017,11 +1168,21 @@ static id<MTLTexture> metalfx(D3DDevice *d, D3DPost *p, id<MTLTexture> src, uint
     return out;
 }
 
-id<MTLTexture> d3d_post_process(D3DDevice *d, id<MTLTexture> src, uint32_t out_w, uint32_t out_h)
+/* True for a pixel format that keeps values above 1 (the float formats of
+   the back buffer and of the post-processing textures). */
+static bool float_format(MTLPixelFormat f)
+{
+    return f == MTLPixelFormatRGBA16Float || f == MTLPixelFormatRGBA32Float || f == MTLPixelFormatRG11B10Float ||
+           f == MTLPixelFormatRGB9E5Float;
+}
+
+id<MTLTexture> d3d_post_process(D3DDevice *d, id<MTLTexture> src, uint32_t out_w, uint32_t out_h, d3d_present_cas *cas)
 {
     int smaa = rt_enh_get(RT_ENH_SMAA), fx = rt_enh_get(RT_ENH_METALFX), sharpen = rt_enh_get(RT_ENH_SHARPEN);
     const MTLTextureUsage rt_read = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
     D3DPost *p;
+    cas->mode = 0;
+    cas->amount = 0.0f;
     if (!smaa && !fx && !sharpen) return src;
     p = post_of(d);
     ensure_psos(d, p, src.pixelFormat);
@@ -1046,12 +1207,13 @@ id<MTLTexture> d3d_post_process(D3DDevice *d, id<MTLTexture> src, uint32_t out_w
                        (unsigned long)depth.height);
                 p->pred_logged = true;
             }
-            post_pass(d, depth.sampleCount > 1 ? p->edges_pred_ms_pso : p->edges_pred_pso, e, src, depth, nil, pr, sizeof pr,
-                      "SMAA edges");
+            smaa_edges_weights(d, p, src, e, w, depth, pr, nil, NULL, 0, si1x, "SMAA");
         }
         else
-            post_pass(d, p->edges_pso, e, src, nil, nil, NULL, 0, "SMAA edges");
-        post_pass(d, p->weights_pso, w, e, diag_texture(d, p), ortho_texture(d, p), si1x, sizeof si1x, "SMAA weights");
+        {
+            static const float no_pr[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            smaa_edges_weights(d, p, src, e, w, nil, no_pr, nil, NULL, 0, si1x, "SMAA");
+        }
         post_pass(d, p->blend_pso, o, src, w, nil, NULL, 0, "SMAA blend");
         src = o;
     }
@@ -1060,7 +1222,16 @@ id<MTLTexture> d3d_post_process(D3DDevice *d, id<MTLTexture> src, uint32_t out_w
     {
         static const float amount[4] = { 0.0f, 0.3f, 0.6f, 1.0f };
         float s = amount[sharpen];
-        id<MTLTexture> o = post_tex(d, &p->cas_out, src.width, src.height, src.pixelFormat, rt_read);
+        id<MTLTexture> o;
+        /* At the drawable size the present pass reads each pixel of src
+           one time (point sampling), so it applies the sharpening. */
+        if (src.width == out_w && src.height == out_h)
+        {
+            cas->mode = float_format(src.pixelFormat) ? 2u : 1u;
+            cas->amount = s;
+            return src;
+        }
+        o = post_tex(d, &p->cas_out, src.width, src.height, src.pixelFormat, rt_read);
         post_pass(d, p->cas_pso, o, src, nil, nil, &s, sizeof s, "sharpening");
         src = o;
     }
