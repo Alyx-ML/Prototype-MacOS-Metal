@@ -69,9 +69,11 @@ for src in "$PORT_DIR"/runtime/src/*.c; do
     name="$(basename "$src" .c)"
     compile -std=c2x -c "$src" -o "$OBJ/$name.o"
 done
+# Same stub flag as tools/package_release.sh: Homebrew clang emits
+# objc_msgSend selector stubs that ld64.lld will not generate.
 for src in "$PORT_DIR"/runtime/src/*.m; do
     name="$(basename "$src" .m)"
-    compile -fobjc-arc -c "$src" -o "$OBJ/$name.o"
+    compile -fobjc-arc -fno-objc-msgsend-selector-stubs -c "$src" -o "$OBJ/$name.o"
 done
 # Helpers that the translated code calls (x87, SSE, string instructions,
 # 64-bit division, fs access): the C files of the SR llasm support. The
@@ -96,6 +98,8 @@ set --
 for o in "$OBJ"/*.o "$PORT_DIR/work/launcher/launcher.o" "$PORT_DIR"/work/engine/parts/engine*.o; do
     set -- "$@" "$o"
 done
+# clang adds -lSystem. The release converter calls ld64.lld itself and
+# must pass libSystem.tbd (see runtime/loader/rt_convert.c).
 "$LLVM/clang" -target $TRIPLE -bundle -undefined dynamic_lookup "$@" -o "$APP/Contents/Resources/Prototype.bundle"
 
 echo "PROGRESS build the loader"
@@ -103,8 +107,8 @@ LOBJ="$PORT_DIR/build/app/loader"
 rm -rf "$LOBJ"
 mkdir -p "$LOBJ"
 compile -std=c2x -c "$PORT_DIR/runtime/loader/rt_convert.c" -o "$LOBJ/rt_convert.o"
-compile -fobjc-arc -DRT_LOADER_DEV=1 -c "$PORT_DIR/runtime/loader/rt_loader.m" -o "$LOBJ/rt_loader.o"
-compile -fobjc-arc -c "$PORT_DIR/runtime/loader/rt_launcher.m" -o "$LOBJ/rt_launcher.o"
+compile -fobjc-arc -fno-objc-msgsend-selector-stubs -DRT_LOADER_DEV=1 -c "$PORT_DIR/runtime/loader/rt_loader.m" -o "$LOBJ/rt_loader.o"
+compile -fobjc-arc -fno-objc-msgsend-selector-stubs -c "$PORT_DIR/runtime/loader/rt_launcher.m" -o "$LOBJ/rt_launcher.o"
 compile -std=c2x -c "$PORT_DIR/runtime/loader/rt_launcher_art.c" -o "$LOBJ/rt_launcher_art.o"
 "$LLVM/clang" -target $TRIPLE -fobjc-arc "$LOBJ/rt_loader.o" "$LOBJ/rt_launcher.o" "$LOBJ/rt_launcher_art.o" "$LOBJ/rt_convert.o" \
     -framework Cocoa -framework QuartzCore -framework Metal -framework AudioToolbox -framework CoreAudio \

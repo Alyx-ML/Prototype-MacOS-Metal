@@ -30,7 +30,8 @@
  *
  * The libraries and frameworks that the runtime uses are linked to this
  * executable; the bundle finds their symbols when dyld loads it
- * (-undefined dynamic_lookup).
+ * (-undefined dynamic_lookup). The bundle still links libSystem
+ * (LC_LOAD_DYLIB): dyld refuses a Mach-O with no dylib load command.
  *
  * An error shows an alert and ends the process.
  */

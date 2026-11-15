@@ -9,7 +9,10 @@
  *   2. llasm translates the llasm files to LLVM IR.
  *   3. opt checks the IR and writes bitcode; llvm-split divides the engine.
  *   4. clang -cc1 compiles each part to an ARM64 object.
- *   5. ld64.lld links the objects and the runtime archive into the bundle.
+ *   5. ld64.lld links the objects, the runtime archive and libSystem.tbd
+ *      into the bundle. dyld requires LC_LOAD_DYLIB for libSystem even
+ *      when the other symbols come from the loader (-undefined
+ *      dynamic_lookup).
  * The converter runs on a thread that is not the main thread.
  */
 #ifndef RT_CONVERT_H
