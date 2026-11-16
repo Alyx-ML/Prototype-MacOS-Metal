@@ -89,8 +89,10 @@ echo "PROGRESS compile the runtime archive"
 for src in "$PORT_DIR"/runtime/src/*.c; do
     compile -std=c2x -c "$src" -o "$OBJ/$(basename "$src" .c).o"
 done
+# ld64.lld with -undefined dynamic_lookup does not synthesize
+# objc_msgSend selector stubs, and dyld cannot resolve those symbols.
 for src in "$PORT_DIR"/runtime/src/*.m; do
-    compile -fobjc-arc -c "$src" -o "$OBJ/$(basename "$src" .m).o"
+    compile -fobjc-arc -fno-objc-msgsend-selector-stubs -c "$src" -o "$OBJ/$(basename "$src" .m).o"
 done
 for src in "$PORT_DIR"/third_party/SR/SR/llasm-support/*.c; do
     name="$(basename "$src" .c)"
@@ -105,8 +107,8 @@ done
 
 echo "PROGRESS build the loader"
 compile -std=c2x -c "$PORT_DIR/runtime/loader/rt_convert.c" -o "$OBJ/loader_rt_convert.o"
-compile -fobjc-arc -DRT_LOADER_DEV=0 -c "$PORT_DIR/runtime/loader/rt_loader.m" -o "$OBJ/loader_rt_loader.o"
-compile -fobjc-arc -c "$PORT_DIR/runtime/loader/rt_launcher.m" -o "$OBJ/loader_rt_launcher.o"
+compile -fobjc-arc -fno-objc-msgsend-selector-stubs -DRT_LOADER_DEV=0 -c "$PORT_DIR/runtime/loader/rt_loader.m" -o "$OBJ/loader_rt_loader.o"
+compile -fobjc-arc -fno-objc-msgsend-selector-stubs -c "$PORT_DIR/runtime/loader/rt_launcher.m" -o "$OBJ/loader_rt_launcher.o"
 compile -std=c2x -c "$PORT_DIR/runtime/loader/rt_launcher_art.c" -o "$OBJ/loader_rt_launcher_art.o"
 for lib in libavcodec libavutil; do
     cp -L "$FFMPEG_PREFIX/lib/$lib.dylib" "$FRAMEWORKS/$lib.dylib"
@@ -183,6 +185,9 @@ CLANG_RT="$("$LLVM/clang" -target $TRIPLE -print-file-name=lib/darwin/libclang_r
 [ -f "$CLANG_RT" ] || die "libclang_rt.osx.a was not found"
 cp "$CLANG_RT" "$REC/lib/libclang_rt.osx.a"
 chmod u+w "$REC/lib/libclang_rt.osx.a"
+# Stub so the converted bundle has LC_LOAD_DYLIB for libSystem. dyld of
+# macOS 15 and later refuses a Mach-O with none (see link_bundle).
+cp "$PORT_DIR/runtime/link/libSystem.tbd" "$REC/lib/libSystem.tbd"
 cp "$PORT_DIR"/third_party/SR/SR/llasm-support/*.llinc "$REC/include/llasm-support/"
 # The SSE helpers as bitcode: the converter links them into the engine
 # parts so that clang can inline them (see tools/build_sse_inline.sh).

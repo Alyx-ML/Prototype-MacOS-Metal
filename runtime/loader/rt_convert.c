@@ -5,8 +5,10 @@
  *   bin/SRW, bin/llasm, bin/opt, bin/llvm-split, bin/llvm-link, bin/clang,
  *   bin/ld64.lld
  *   lib/                    the LLVM, lld, z3 and zstd libraries,
- *                           libprototype_rt.a (the runtime objects) and
- *                           libclang_rt.osx.a
+ *                           libprototype_rt.a (the runtime objects),
+ *                           libclang_rt.osx.a, and libSystem.tbd (a stub
+ *                           so the bundle has LC_LOAD_DYLIB for libSystem;
+ *                           dyld refuses a Mach-O with none)
  *   include/llasm-support   the .llinc files of the SR llasm support and
  *                           sse_inline.bc (the SSE helpers as bitcode,
  *                           made by tools/build_sse_inline.sh)
@@ -44,6 +46,7 @@
 #include <sys/sysctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <mach-o/loader.h>
 
 #define PATH_LEN 1024
 #define MAX_JOBS 16u
@@ -771,19 +774,77 @@ static bool convert_module(rt_convert_job *job, const module_def *m, const manif
     return ok;
 }
 
+/* dyld of macOS 15 and later refuses a Mach-O with no LC_LOAD_DYLIB
+   ("must link with at least libSystem.dylib"). The converter links with
+   -undefined dynamic_lookup, so ld64.lld would otherwise emit none. */
+static bool bundle_links_libsystem(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    struct mach_header_64 mh;
+    unsigned char *cmds = NULL;
+    uint32_t off = 0;
+    bool ok = false;
+
+    if (f == NULL) return false;
+    if (fread(&mh, sizeof mh, 1, f) != 1 || mh.magic != MH_MAGIC_64 || mh.sizeofcmds == 0 || mh.sizeofcmds > (1u << 20))
+    {
+        fclose(f);
+        return false;
+    }
+    cmds = malloc(mh.sizeofcmds);
+    if (cmds == NULL || fread(cmds, 1, mh.sizeofcmds, f) != mh.sizeofcmds)
+    {
+        free(cmds);
+        fclose(f);
+        return false;
+    }
+    fclose(f);
+    while (off + sizeof(struct load_command) <= mh.sizeofcmds)
+    {
+        struct load_command lc;
+        memcpy(&lc, cmds + off, sizeof lc);
+        if (lc.cmdsize < sizeof lc || off + lc.cmdsize > mh.sizeofcmds) break;
+        if (lc.cmd == LC_LOAD_DYLIB || lc.cmd == LC_LOAD_WEAK_DYLIB || lc.cmd == LC_REEXPORT_DYLIB ||
+            lc.cmd == LC_LOAD_UPWARD_DYLIB)
+        {
+            struct dylib_command dc;
+            uint32_t name_off;
+            memcpy(&dc, cmds + off, sizeof dc);
+            name_off = dc.dylib.name.offset;
+            if (name_off < lc.cmdsize)
+            {
+                const char *name = (const char *)(cmds + off + name_off);
+                size_t max = lc.cmdsize - name_off;
+                if (max > 0 && strnlen(name, max) < max && strstr(name, "libSystem") != NULL)
+                {
+                    ok = true;
+                    break;
+                }
+            }
+        }
+        off += lc.cmdsize;
+    }
+    free(cmds);
+    return ok;
+}
+
 static bool link_bundle(rt_convert_job *job, const manifest *mf, const objects *objs)
 {
-    char tool[PATH_LEN], log[PATH_LEN], tmp[PATH_LEN], rtlib[PATH_LEN], crt[PATH_LEN];
+    char tool[PATH_LEN], log[PATH_LEN], tmp[PATH_LEN], rtlib[PATH_LEN], crt[PATH_LEN], syslib[PATH_LEN];
     const char **argv;
     unsigned i, k = 1;
     bool ok;
+    struct stat st;
 
     if (!join(tool, sizeof tool, job->recompiler, "bin/ld64.lld") || !join(log, sizeof log, job->work_dir, "link.log") ||
         !join(rtlib, sizeof rtlib, job->recompiler, "lib/libprototype_rt.a") ||
         !join(crt, sizeof crt, job->recompiler, "lib/libclang_rt.osx.a") ||
+        !join(syslib, sizeof syslib, job->recompiler, "lib/libSystem.tbd") ||
         (size_t)snprintf(tmp, sizeof tmp, "%s.tmp", job->out_bundle) >= sizeof tmp)
         return fail(job, "a path is too long");
-    argv = calloc(objs->n + 20, sizeof *argv);
+    if (stat(syslib, &st) != 0 || !S_ISREG(st.st_mode))
+        return fail(job, "the converter is missing %s", syslib);
+    argv = calloc(objs->n + 24, sizeof *argv);
     if (argv == NULL) return fail(job, "out of memory");
     argv[k++] = "-arch";
     argv[k++] = "arm64";
@@ -793,9 +854,12 @@ static bool link_bundle(rt_convert_job *job, const manifest *mf, const objects *
     argv[k++] = mf->sdk;
     argv[k++] = "-bundle";
     /* The libraries and frameworks are loaded by the loader executable;
-       dyld finds their symbols when it loads the bundle. */
+       dyld finds their symbols when it loads the bundle. libSystem.tbd is
+       still required: it adds LC_LOAD_DYLIB without resolving symbols. */
     argv[k++] = "-undefined";
     argv[k++] = "dynamic_lookup";
+    argv[k++] = "-needed_library";
+    argv[k++] = syslib;
     argv[k++] = "-o";
     argv[k++] = tmp;
     for (i = 0; i < objs->n; i++) argv[k++] = objs->path[i];
@@ -807,6 +871,8 @@ static bool link_bundle(rt_convert_job *job, const manifest *mf, const objects *
     ok = run_tool(job, "ld64.lld", tool, argv, job->work_dir, log);
     free(argv);
     if (!ok) return false;
+    if (!bundle_links_libsystem(tmp))
+        return fail(job, "ld64.lld wrote %s without LC_LOAD_DYLIB for libSystem", tmp);
     if (rename(tmp, job->out_bundle) != 0) return fail(job, "cannot rename %s: %s", tmp, strerror(errno));
     return true;
 }
